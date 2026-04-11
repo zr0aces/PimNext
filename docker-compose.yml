@@ -1,8 +1,8 @@
 services:
-  printermasterbot:
+  printbot:
     build: .
-    image: printermasterbot
-    container_name: printermasterbot
+    image: printbot
+    container_name: printbot
     restart: always
     devices:
       - /dev/usb/lp0:/dev/usb/lp0

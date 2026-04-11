@@ -3,6 +3,7 @@ import subprocess
 import time
 import logging
 
+from telegram import BotCommand
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
 
@@ -10,9 +11,18 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 
-logger = logging.getLogger("bot")
+logger = logging.getLogger("printbot")
 
 DATA_DIR = "data"
+
+HELP_TEXT = (
+    "📠 *PrintBot Commands*\n\n"
+    "/start — Show the welcome message\n"
+    "/help — Show this help message\n"
+    "/status — Check printer availability\n"
+    "/clean — Delete cached files (allowed users only)\n\n"
+    "Send a *photo* or *document* to print it."
+)
 
 
 def get_allowed_usernames():
@@ -25,28 +35,68 @@ def get_allowed_usernames():
 async def start(update, context):
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text="I'm Printer, send me a photo or document to print!",
+        text=(
+            "👋 Welcome to *PrintBot*!\n\n"
+            "Send me a photo or document and I'll print it for you.\n\n"
+            "Use /help to see all available commands."
+        ),
+        parse_mode="Markdown",
+    )
+
+
+async def help_command(update, context):
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=HELP_TEXT,
+        parse_mode="Markdown",
+    )
+
+
+async def status(update, context):
+    """Report whether the printer is reachable via CUPS."""
+    try:
+        result = subprocess.run(
+            ["/usr/bin/lpstat", "-p"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            msg = f"🟢 Printer is available:\n```\n{result.stdout.strip()}\n```"
+        else:
+            msg = "🔴 No printers are currently available. Check CUPS configuration."
+    except FileNotFoundError:
+        msg = "⚠️ CUPS client tools (`lpstat`) not found on this system."
+    except subprocess.TimeoutExpired:
+        msg = "⚠️ Printer status check timed out."
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=msg,
+        parse_mode="Markdown",
     )
 
 
 async def clean(update, context):
+    removed = 0
     if os.path.exists(DATA_DIR):
         for filename in os.listdir(DATA_DIR):
             filepath = os.path.join(DATA_DIR, filename)
             try:
                 if os.path.isfile(filepath):
                     os.remove(filepath)
+                    removed += 1
             except OSError as e:
-                logger.error(f"Error removing {filepath}: {e}")
+                logger.error("Error removing %s: %s", filepath, e)
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text="Cleaning up old downloaded files from data folder",
+        text=f"🗑️ Cleaned up {removed} cached file(s) from the data folder.",
     )
 
 
 async def print_msg(update, context):
-    logger.info("Received message type: %s", type(update))
-    logger.info("Message: %s", update.effective_message)
+    logger.info("Received message from %s", update.effective_user.username)
 
     file = None
     if update.effective_message.photo:
@@ -58,7 +108,7 @@ async def print_msg(update, context):
     if file is None:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="Could not find a printable file in your message.",
+            text="❌ Could not find a printable file in your message.",
         )
         return
 
@@ -70,13 +120,13 @@ async def print_msg(update, context):
     try:
         print_file(file_path)
         await context.bot.send_message(
-            chat_id=update.effective_chat.id, text="Printing..."
+            chat_id=update.effective_chat.id, text="✅ Sent to printer!"
         )
     except Exception as e:
         logger.error("Print failed: %s", e)
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="Print failed. Please check the printer and try again.",
+            text="❌ Print failed. Please check the printer and try again.",
         )
 
 
@@ -92,6 +142,16 @@ def print_file(file_path):
     logger.info("lp stdout: %s", result.stdout)
 
 
+async def post_init(application):
+    """Register bot commands in the Telegram menu after startup."""
+    await application.bot.set_my_commands([
+        BotCommand("start", "Show the welcome message"),
+        BotCommand("help", "Show available commands"),
+        BotCommand("status", "Check printer availability"),
+        BotCommand("clean", "Delete cached files (allowed users only)"),
+    ])
+
+
 def main():
     token = os.getenv("TOKEN")
     if not token:
@@ -100,9 +160,16 @@ def main():
 
     allowed_usernames = get_allowed_usernames()
 
-    application = ApplicationBuilder().token(token).build()
+    application = (
+        ApplicationBuilder()
+        .token(token)
+        .post_init(post_init)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", status))
 
     if allowed_usernames:
         username_filter = filters.Chat(username=allowed_usernames)
@@ -122,7 +189,7 @@ def main():
         )
     )
 
-    logger.info("Bot starting with allowed users: %s", allowed_usernames or "ALL")
+    logger.info("PrintBot starting with allowed users: %s", allowed_usernames or "ALL")
     application.run_polling()
 
 

@@ -1,11 +1,11 @@
 [Unit]
-Description=telegram bot for printing
+Description=PrintBot - Telegram bot for printing
 After=cups.service
 
 [Service]
-EnvironmentFile=/home/pi/printermasterbot/.env
+EnvironmentFile=/home/pi/printbot/.env
 User=pi
-WorkingDirectory=/home/pi/printermasterbot
+WorkingDirectory=/home/pi/printbot
 ExecStart=/usr/bin/python3 bot.py
 Restart=on-failure
 RestartSec=10
