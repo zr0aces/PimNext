@@ -7,9 +7,12 @@ PrintBot is a Telegram bot that sends photos and documents straight to a CUPS-co
 **Key features**
 
 - 📄 Print photos and documents sent via Telegram
+- ⚙️ Print options — send `bw`, `2x`, `3x`, `4x` before a file to customise the print
 - 🔒 Access control via numeric chat IDs (`ALLOWED_CHAT_IDS`)
 - 🖨️ CUPS integration — uses the `lp` command under the hood
 - 🟢 `/status` command to check live printer availability
+- 📭 `/jobs` and `/cancel` commands for queue management
+- 🏠 Optional Home Assistant webhook after each print
 - 🐳 Docker and systemd deployment options
 - ✅ No shell injection — all commands use argument lists
 
@@ -49,6 +52,8 @@ cp .env.example .env
 |----------|----------|-------------|
 | `TOKEN` | ✅ Yes | Telegram Bot API token from [@BotFather](https://t.me/BotFather) |
 | `ALLOWED_CHAT_IDS` | ❌ No | Comma-separated numeric chat IDs permitted to print/clean. **If unset, anyone can print.** Find your ID via [@userinfobot](https://t.me/userinfobot). |
+| `HA_URL` | ❌ No | Home Assistant base URL (e.g. `http://homeassistant:8123`). Required together with `HA_TOKEN` for webhook integration. |
+| `HA_TOKEN` | ❌ No | Home Assistant long-lived access token. Required together with `HA_URL` for webhook integration. |
 
 ---
 
@@ -104,7 +109,21 @@ Once the bot is running, open it in Telegram and:
 | `/start` | Show the welcome message | Everyone |
 | `/help` | List available commands | Everyone |
 | `/status` | Check printer availability via CUPS | Everyone |
+| `/jobs` | Show the current print queue | Allowed chat IDs only |
+| `/cancel` | Cancel all pending print jobs | Allowed chat IDs only |
 | `/clean` | Delete cached downloaded files | Allowed chat IDs only |
+
+#### Print Options
+
+Before sending a file, you can text the bot with options for the next print:
+
+| Option | Effect |
+|--------|--------|
+| `bw` or `gray` | Print in black & white |
+| `2x`, `3x`, `4x` | Print multiple copies |
+| `bw 2x` | Combine options |
+
+Options apply to the **next** file only, then reset to defaults (colour, 1 copy).
 
 ---
 
