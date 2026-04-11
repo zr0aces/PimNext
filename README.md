@@ -53,7 +53,7 @@ python bot.py
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `TOKEN` | ✅ Yes | Telegram Bot API token from [@BotFather](https://t.me/BotFather) |
-| `ALLOWED_USERNAMES` | ❌ No | Comma-separated Telegram usernames permitted to print/clean. If unset, all users can interact. |
+| `ALLOWED_USERNAMES` | ❌ No | Comma-separated Telegram usernames permitted to print/clean. **If unset, all Telegram users can send files to your printer** — set this in production. |
 
 Copy `.env.example` to `.env` and fill in your values:
 

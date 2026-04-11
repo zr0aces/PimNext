@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import time
 import logging
@@ -54,9 +55,17 @@ async def help_command(update, context):
 
 async def status(update, context):
     """Report whether the printer is reachable via CUPS."""
+    lpstat = shutil.which("lpstat")
+    if not lpstat:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="⚠️ CUPS client tools (`lpstat`) not found on this system.",
+        )
+        return
+
     try:
         result = subprocess.run(
-            ["/usr/bin/lpstat", "-p"],
+            [lpstat, "-p"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -66,8 +75,6 @@ async def status(update, context):
             msg = f"🟢 Printer is available:\n```\n{result.stdout.strip()}\n```"
         else:
             msg = "🔴 No printers are currently available. Check CUPS configuration."
-    except FileNotFoundError:
-        msg = "⚠️ CUPS client tools (`lpstat`) not found on this system."
     except subprocess.TimeoutExpired:
         msg = "⚠️ Printer status check timed out."
 
@@ -132,7 +139,10 @@ async def print_msg(update, context):
 
 def print_file(file_path):
     """Send a file to the printer using lp."""
-    cmd = ["/usr/bin/lp", "-o", "fit-to-page", "-o", "media=A4", file_path]
+    lp = shutil.which("lp")
+    if not lp:
+        raise RuntimeError("lp command not found — is cups-client installed?")
+    cmd = [lp, "-o", "fit-to-page", "-o", "media=A4", file_path]
     logger.info("Printing %s", file_path)
     logger.debug("Command: %s", cmd)
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -174,6 +184,10 @@ def main():
     if allowed_usernames:
         username_filter = filters.Chat(username=allowed_usernames)
     else:
+        logger.warning(
+            "ALLOWED_USERNAMES is not set — all Telegram users can print. "
+            "Set this variable to restrict access."
+        )
         username_filter = filters.ALL
 
     application.add_handler(
