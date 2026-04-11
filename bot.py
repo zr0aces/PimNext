@@ -21,6 +21,9 @@ DATA_DIR = "data"
 # Per-chat print options: {chat_id: {"color": bool, "copies": int}}
 print_options = {}
 
+# Maximum characters of stderr to include in error replies
+MAX_STDERR_LENGTH = 120
+
 HELP_TEXT = (
     "📠 *PrintBot Commands*\n\n"
     "/start — Show the welcome message\n"
@@ -178,7 +181,7 @@ async def cancel_command(update, context):
         if result.returncode == 0:
             msg = "🗑️ All print jobs cancelled"
         else:
-            stderr = result.stderr.strip()[:120]
+            stderr = result.stderr.strip()[:MAX_STDERR_LENGTH]
             msg = f"⚠️ Could not cancel jobs: {stderr}"
     except subprocess.TimeoutExpired:
         msg = "⚠️ Cancel command timed out."
@@ -296,7 +299,7 @@ def print_file(file_path, color=True, copies=1):
     logger.debug("Command: %s", cmd)
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
-        stderr = result.stderr.strip()[:120]
+        stderr = result.stderr.strip()[:MAX_STDERR_LENGTH]
         logger.error("lp stderr: %s", result.stderr)
         raise RuntimeError(stderr or "Print command failed")
     logger.info("lp stdout: %s", result.stdout)
