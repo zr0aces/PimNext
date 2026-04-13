@@ -1,7 +1,7 @@
+import asyncio
 import json
 import os
 import shutil
-import subprocess
 import time
 import logging
 import urllib.request
@@ -104,22 +104,23 @@ async def status(update, context):
 
     try:
         cmd = [lpstat] + get_cups_args() + ["-p"]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
-        if result.returncode == 0:
-            if result.stdout.strip():
-                msg = f"🟢 Printer is available:\n```\n{result.stdout.strip()}\n```"
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
+        
+        if process.returncode == 0:
+            out_str = stdout.decode().strip()
+            if out_str:
+                msg = f"🟢 Printer is available:\n```\n{out_str}\n```"
             else:
                 msg = "🟡 No printers are currently registered on the server."
         else:
-            stderr = result.stderr.strip()[:MAX_STDERR_LENGTH]
-            msg = f"🔴 Could not reach printer server:\n`{stderr or 'Unknown error'}`"
-    except subprocess.TimeoutExpired:
+            err_str = stderr.decode().strip()[:MAX_STDERR_LENGTH]
+            msg = f"🔴 Could not reach printer server:\n`{err_str or 'Unknown error'}`"
+    except asyncio.TimeoutError:
         msg = "⚠️ Printer status check timed out."
 
     await context.bot.send_message(
@@ -130,16 +131,7 @@ async def status(update, context):
 
 
 async def clean(update, context):
-    removed = 0
-    if os.path.exists(DATA_DIR):
-        for filename in os.listdir(DATA_DIR):
-            filepath = os.path.join(DATA_DIR, filename)
-            try:
-                if os.path.isfile(filepath):
-                    os.remove(filepath)
-                    removed += 1
-            except OSError as e:
-                logger.error("Error removing %s: %s", filepath, e)
+    removed = perform_cleanup()
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=f"🗑️ Cleaned up {removed} cached file(s) from the data folder.",
@@ -158,22 +150,23 @@ async def jobs_command(update, context):
 
     try:
         cmd = [lpstat] + get_cups_args() + ["-o"]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
-        if result.returncode == 0:
-            if result.stdout.strip():
-                msg = f"🖨️ Print queue:\n```\n{result.stdout.strip()}\n```"
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
+
+        if process.returncode == 0:
+            out_str = stdout.decode().strip()
+            if out_str:
+                msg = f"🖨️ Print queue:\n```\n{out_str}\n```"
             else:
                 msg = "📭 No jobs in queue"
         else:
-            stderr = result.stderr.strip()[:MAX_STDERR_LENGTH]
-            msg = f"⚠️ Could not fetch queue: `{stderr or 'Unknown error'}`"
-    except subprocess.TimeoutExpired:
+            err_str = stderr.decode().strip()[:MAX_STDERR_LENGTH]
+            msg = f"⚠️ Could not fetch queue: `{err_str or 'Unknown error'}`"
+    except asyncio.TimeoutError:
         msg = "⚠️ Print queue check timed out."
 
     await context.bot.send_message(
@@ -195,19 +188,19 @@ async def cancel_command(update, context):
 
     try:
         cmd = [cancel_bin] + get_cups_args() + ["-a"]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
-        if result.returncode == 0:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
+
+        if process.returncode == 0:
             msg = "🗑️ All print jobs cancelled"
         else:
-            stderr = result.stderr.strip()[:MAX_STDERR_LENGTH]
-            msg = f"⚠️ Could not cancel jobs: {stderr}"
-    except subprocess.TimeoutExpired:
+            err_str = stderr.decode().strip()[:MAX_STDERR_LENGTH]
+            msg = f"⚠️ Could not cancel jobs: {err_str}"
+    except asyncio.TimeoutError:
         msg = "⚠️ Cancel command timed out."
 
     await context.bot.send_message(
@@ -285,7 +278,7 @@ async def print_msg(update, context):
     copies = opts["copies"]
 
     try:
-        print_file(file_path, color=color, copies=copies)
+        await print_file(file_path, color=color, copies=copies)
         await context.bot.send_message(
             chat_id=chat_id, text="✅ Sent to printer!"
         )
@@ -308,7 +301,7 @@ async def print_msg(update, context):
         )
 
 
-def print_file(file_path, color=True, copies=1):
+async def print_file(file_path, color=True, copies=1):
     """Send a file to the printer using lp."""
     lp = shutil.which("lp")
     if not lp:
@@ -326,12 +319,19 @@ def print_file(file_path, color=True, copies=1):
     cmd.append(file_path)
     logger.info("Printing %s", file_path)
     logger.debug("Command: %s", cmd)
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        stderr = result.stderr.strip()[:MAX_STDERR_LENGTH]
-        logger.error("lp stderr: %s", result.stderr)
-        raise RuntimeError(stderr or "Print command failed")
-    logger.info("lp stdout: %s", result.stdout)
+    
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await process.communicate()
+    
+    if process.returncode != 0:
+        err_str = stderr.decode().strip()[:MAX_STDERR_LENGTH]
+        logger.error("lp stderr: %s", stderr.decode())
+        raise RuntimeError(err_str or "Print command failed")
+    logger.info("lp stdout: %s", stdout.decode())
 
 
 def notify_homeassistant(file_name, chat_id, copies, color):
@@ -365,7 +365,8 @@ def notify_homeassistant(file_name, chat_id, copies, color):
 
 
 async def post_init(application):
-    """Register bot commands in the Telegram menu after startup."""
+    """Register bot commands and start backup/cleanup tasks."""
+    # Register commands in the Telegram menu
     await application.bot.set_my_commands([
         BotCommand("start", "Show the welcome message"),
         BotCommand("help", "Show available commands"),
@@ -374,6 +375,34 @@ async def post_init(application):
         BotCommand("cancel", "Cancel all print jobs"),
         BotCommand("clean", "Delete cached files (allowed users only)"),
     ])
+    
+    # Start periodic cleanup task (every 6 hours)
+    asyncio.create_task(cleanup_task())
+    logger.info("Periodic cleanup task started (6h interval)")
+
+async def cleanup_task():
+    """Background task to periodically clean up the data directory."""
+    while True:
+        await asyncio.sleep(6 * 3600)  # 6 hours
+        logger.info("Running periodic data cleanup...")
+        try:
+            perform_cleanup()
+        except Exception as e:
+            logger.error("Periodic cleanup failed: %s", e)
+
+def perform_cleanup():
+    """Shared logic for deleting cached files."""
+    removed = 0
+    if os.path.exists(DATA_DIR):
+        for filename in os.listdir(DATA_DIR):
+            filepath = os.path.join(DATA_DIR, filename)
+            try:
+                if os.path.isfile(filepath):
+                    os.remove(filepath)
+                    removed += 1
+            except OSError as e:
+                logger.error("Error removing %s: %s", filepath, e)
+    return removed
 
 
 def main():
@@ -383,6 +412,10 @@ def main():
         raise SystemExit("TOKEN environment variable is required")
 
     allowed_chat_ids = get_allowed_chat_ids()
+
+    # Perform startup cleanup
+    logger.info("Performing startup cleanup...")
+    perform_cleanup()
 
     application = (
         ApplicationBuilder()

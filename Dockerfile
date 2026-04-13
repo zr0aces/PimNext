@@ -11,13 +11,15 @@ LABEL org.opencontainers.image.title="PrintBot" \
 # Avoid interactive prompts during build
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install Python 3, pip, and CUPS client 2.4.1
+# Install Python 3, pip, CUPS client, and healthcheck utilities
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     cups-client \
-    ca-certificates && \
+    ca-certificates \
+    procps && \
+    apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -27,6 +29,10 @@ COPY requirements.txt /app/requirements.txt
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY . /app
+
+# Basic healthcheck: ensure the bot process is active
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD pgrep -f bot.py || exit 1
 
 # Use python3 explicitly for Ubuntu
 CMD ["python3", "bot.py"]
