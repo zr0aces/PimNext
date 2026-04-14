@@ -298,12 +298,14 @@ async def print_msg(update, context):
         )
     except Exception as e:
         logger.error("Print failed: %s", e)
-        # Include the command in the error message for easier debugging
-        msg = f"❌ Print failed: {e}\n\n`{getattr(e, 'cmd', 'Unknown command')}`"
+        cmd_used = getattr(e, "cmd", None)
+        if cmd_used:
+            msg = f"❌ Print failed: {e}\n\nCommand used:\n{cmd_used}"
+        else:
+            msg = f"❌ Print failed: {e}"
         await context.bot.send_message(
             chat_id=chat_id,
             text=msg,
-            parse_mode="Markdown",
         )
 
 
