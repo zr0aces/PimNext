@@ -58,6 +58,8 @@ cp .env.example .env
 |----------|----------|-------------|
 | `TOKEN` | ✅ Yes | Telegram Bot API token from [@BotFather](https://t.me/BotFather) |
 | `ALLOWED_CHAT_IDS` | ❌ No | Comma-separated numeric chat IDs permitted to print/clean. **If unset, anyone can print.** Find your ID via [@userinfobot](https://t.me/userinfobot). |
+| `CUPS_SERVER` | ❌ No | CUPS server address (e.g. `cups` or `192.168.1.100`). Default is `cups`. |
+| `PRINTER_NAME` | ❌ No | Specific printer name to use (e.g. `Canon_LBP7110Cw`). If unset, CUPS uses the server's default printer. |
 | `HA_URL` | ❌ No | Home Assistant base URL (e.g. `http://homeassistant:8123`). Required together with `HA_TOKEN` for webhook integration. |
 | `HA_TOKEN` | ❌ No | Home Assistant long-lived access token. Required together with `HA_URL` for webhook integration. |
 

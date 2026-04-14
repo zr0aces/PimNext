@@ -18,6 +18,7 @@ RUN apt-get update && \
     python3-pip \
     cups-client \
     ca-certificates \
+    curl \
     procps && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
@@ -29,6 +30,10 @@ COPY requirements.txt /app/requirements.txt
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY . /app
+
+# Setup entrypoint for CUPS configuration
+RUN chmod +x /app/docker-entrypoint.sh
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 
 # Basic healthcheck: ensure the bot process is active
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
