@@ -10,35 +10,102 @@ from telegram import BotCommand
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
 
-# Set log level from environment variable
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+# Set log level from environment variable (default INFO)
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
-    level=getattr(logging, log_level, logging.INFO)
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=getattr(logging, log_level, logging.INFO),
 )
 
+# Suppress noisy library loggers — only show WARNING and above from these
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+
 logger = logging.getLogger("printbot")
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 VERSION = "1.0.0"
 DATA_DIR = "data"
 
-# Per-chat print options: {chat_id: {"color": bool, "copies": int}}
-print_options = {}
-
 # Maximum characters of stderr to include in error replies
-MAX_STDERR_LENGTH = 120
+MAX_STDERR_LENGTH = 300
 
-def get_cups_args():
-    """Build common arguments for CUPS commands based on environment variables."""
-    args = []
+# Per-chat print options: {chat_id: {"color": bool, "copies": int, "ts": float}}
+# Entries expire after PRINT_OPTIONS_TTL seconds.
+print_options: dict = {}
+PRINT_OPTIONS_TTL = 600  # 10 minutes
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def get_cups_server() -> str:
+    """Return the configured CUPS server host. Raises if not set."""
     server = os.getenv("CUPS_SERVER")
-    if server:
-        args += ["-h", server]
-    return args
+    if not server:
+        raise RuntimeError("CUPS_SERVER environment variable is not set")
+    return server
 
-def get_printer_name():
-    """Get the target printer name from environment variables."""
-    return os.getenv("PRINTER_NAME")
+
+def get_printer_name() -> str:
+    """Return the configured printer name. Raises if not set."""
+    printer = os.getenv("PRINTER_NAME")
+    if not printer:
+        raise RuntimeError("PRINTER_NAME environment variable is not set")
+    return printer
+
+
+def get_allowed_chat_ids() -> list[int]:
+    """Parse allowed chat IDs from environment variable (comma or space separated).
+
+    Chat IDs are permanent numeric identifiers assigned by Telegram and cannot
+    be changed or spoofed, making them reliable for access control.
+    """
+    raw = os.getenv("ALLOWED_CHAT_IDS", "")
+    ids = []
+    for part in raw.replace(",", " ").split():
+        part = part.strip()
+        if part:
+            try:
+                ids.append(int(part))
+            except ValueError:
+                logger.warning("Ignoring non-integer value in ALLOWED_CHAT_IDS: %r", part)
+    return ids
+
+
+def pop_print_options(chat_id: int) -> dict:
+    """Return and remove print options for a chat, respecting the TTL.
+
+    Returns defaults if no options are set or the options have expired.
+    """
+    entry = print_options.pop(chat_id, None)
+    if entry and (time.monotonic() - entry.get("ts", 0)) < PRINT_OPTIONS_TTL:
+        return entry
+    return {"color": True, "copies": 1}
+
+
+async def run_cups_command(cmd: list[str], timeout: int = 5) -> tuple[str, str, int]:
+    """Run a CUPS CLI command and return (stdout, stderr, returncode)."""
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    return stdout.decode(), stderr.decode(), process.returncode
+
+
+# ---------------------------------------------------------------------------
+# Bot text constants
+# ---------------------------------------------------------------------------
 
 HELP_TEXT = (
     "📠 *PrintBot Commands*\n\n"
@@ -55,164 +122,122 @@ HELP_TEXT = (
     "  `bw 2x` — combine options"
 )
 
+COPY_OPTIONS = {"2x": 2, "3x": 3, "4x": 4}
 
-def get_allowed_chat_ids():
-    """Parse allowed chat IDs from environment variable (comma or space separated).
 
-    Returns a list of integer chat IDs. Chat IDs are permanent numeric identifiers
-    assigned by Telegram and cannot be changed or spoofed, making them more reliable
-    than usernames for access control.
-    """
-    raw = os.getenv("ALLOWED_CHAT_IDS", "")
-    ids = []
-    for part in raw.replace(",", " ").split():
-        part = part.strip()
-        if part:
-            try:
-                ids.append(int(part))
-            except ValueError:
-                logger.warning("Ignoring non-integer value in ALLOWED_CHAT_IDS: %r", part)
-    return ids
-
+# ---------------------------------------------------------------------------
+# Command handlers
+# ---------------------------------------------------------------------------
 
 async def start(update, context):
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=(
-            "👋 Welcome to *PrintBot*!\n\n"
-            "Send me a photo or document and I'll print it for you.\n\n"
-            "Use /help to see all available commands."
-        ),
+    await update.effective_message.reply_text(
+        "👋 Welcome to *PrintBot*!\n\n"
+        "Send me a photo or document and I'll print it for you.\n\n"
+        "Use /help to see all available commands.",
         parse_mode="Markdown",
     )
 
 
 async def help_command(update, context):
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=HELP_TEXT,
-        parse_mode="Markdown",
-    )
+    await update.effective_message.reply_text(HELP_TEXT, parse_mode="Markdown")
 
 
 async def status(update, context):
-    """Report whether the printer is reachable via CUPS."""
+    """Report whether the configured printer is reachable via CUPS."""
     lpstat = shutil.which("lpstat")
     if not lpstat:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="⚠️ CUPS client tools (`lpstat`) not found on this system.",
+        await update.effective_message.reply_text(
+            "⚠️ CUPS client tools (`lpstat`) not found on this system.",
         )
         return
 
     try:
-        cmd = [lpstat] + get_cups_args() + ["-p"]
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
-        
-        if process.returncode == 0:
-            out_str = stdout.decode().strip()
-            if out_str:
-                msg = f"🟢 Printer is available:\n```\n{out_str}\n```"
+        server = get_cups_server()
+        cmd = [lpstat, "-h", server, "-p"]
+        stdout, stderr, returncode = await run_cups_command(cmd, timeout=5)
+
+        if returncode == 0:
+            if stdout.strip():
+                msg = f"🟢 Printer is available:\n```\n{stdout.strip()}\n```"
             else:
                 msg = "🟡 No printers are currently registered on the server."
         else:
-            err_str = stderr.decode().strip()[:MAX_STDERR_LENGTH]
-            msg = f"🔴 Could not reach printer server:\n`{err_str or 'Unknown error'}`"
+            err = stderr.strip()[:MAX_STDERR_LENGTH]
+            msg = f"🔴 Could not reach printer server:\n`{err or 'Unknown error'}`"
+
     except asyncio.TimeoutError:
         msg = "⚠️ Printer status check timed out."
+    except RuntimeError as e:
+        msg = f"⚠️ Configuration error: {e}"
 
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=msg,
-        parse_mode="Markdown",
-    )
-
-
-async def clean(update, context):
-    removed = perform_cleanup()
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=f"🗑️ Cleaned up {removed} cached file(s) from the data folder.",
-    )
+    await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
 
 async def jobs_command(update, context):
     """Show the current CUPS print queue."""
     lpstat = shutil.which("lpstat")
     if not lpstat:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="⚠️ CUPS client tools (`lpstat`) not found on this system.",
+        await update.effective_message.reply_text(
+            "⚠️ CUPS client tools (`lpstat`) not found on this system.",
         )
         return
 
     try:
-        cmd = [lpstat] + get_cups_args() + ["-o"]
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
+        server = get_cups_server()
+        cmd = [lpstat, "-h", server, "-o"]
+        stdout, stderr, returncode = await run_cups_command(cmd, timeout=5)
 
-        if process.returncode == 0:
-            out_str = stdout.decode().strip()
-            if out_str:
-                msg = f"🖨️ Print queue:\n```\n{out_str}\n```"
-            else:
-                msg = "📭 No jobs in queue"
+        if returncode == 0:
+            msg = (
+                f"🖨️ Print queue:\n```\n{stdout.strip()}\n```"
+                if stdout.strip()
+                else "📭 No jobs in queue"
+            )
         else:
-            err_str = stderr.decode().strip()[:MAX_STDERR_LENGTH]
-            msg = f"⚠️ Could not fetch queue: `{err_str or 'Unknown error'}`"
+            err = stderr.strip()[:MAX_STDERR_LENGTH]
+            msg = f"⚠️ Could not fetch queue: {err or 'Unknown error'}"
+
     except asyncio.TimeoutError:
         msg = "⚠️ Print queue check timed out."
+    except RuntimeError as e:
+        msg = f"⚠️ Configuration error: {e}"
 
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=msg,
-        parse_mode="Markdown",
-    )
+    await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
 
 async def cancel_command(update, context):
     """Cancel all pending print jobs."""
     cancel_bin = shutil.which("cancel")
     if not cancel_bin:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="⚠️ CUPS client tools (`cancel`) not found on this system.",
+        await update.effective_message.reply_text(
+            "⚠️ CUPS client tools (`cancel`) not found on this system.",
         )
         return
 
     try:
-        cmd = [cancel_bin] + get_cups_args() + ["-a"]
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
+        server = get_cups_server()
+        cmd = [cancel_bin, "-h", server, "-a"]
+        _, stderr, returncode = await run_cups_command(cmd, timeout=5)
 
-        if process.returncode == 0:
+        if returncode == 0:
             msg = "🗑️ All print jobs cancelled"
         else:
-            err_str = stderr.decode().strip()[:MAX_STDERR_LENGTH]
-            msg = f"⚠️ Could not cancel jobs: {err_str}"
+            err = stderr.strip()[:MAX_STDERR_LENGTH]
+            msg = f"⚠️ Could not cancel jobs: {err or 'Unknown error'}"
+
     except asyncio.TimeoutError:
         msg = "⚠️ Cancel command timed out."
+    except RuntimeError as e:
+        msg = f"⚠️ Configuration error: {e}"
 
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=msg,
+    await update.effective_message.reply_text(msg)
+
+
+async def clean(update, context):
+    removed = perform_cleanup()
+    await update.effective_message.reply_text(
+        f"🗑️ Cleaned up {removed} cached file(s) from the data folder."
     )
-
-
-COPY_OPTIONS = {"2x": 2, "3x": 3, "4x": 4}
 
 
 async def set_print_options(update, context):
@@ -234,100 +259,112 @@ async def set_print_options(update, context):
             valid = False
 
     if not valid or not tokens:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="❓ Unknown option. Use: `bw`, `2x`, `3x`, `4x`, `bw 2x`",
+        await update.effective_message.reply_text(
+            "❓ Unknown option. Use: `bw`, `2x`, `3x`, `4x`, `bw 2x`",
             parse_mode="Markdown",
         )
         return
 
-    print_options[chat_id] = {"color": color, "copies": copies}
+    print_options[chat_id] = {"color": color, "copies": copies, "ts": time.monotonic()}
 
-    parts = []
-    parts.append("B&W" if not color else "Color")
-    parts.append(f"{copies} copies" if copies > 1 else "1 copy")
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"⚙️ Next print: {', '.join(parts)}",
-    )
+    mode = "B&W" if not color else "Color"
+    count = f"{copies} copies" if copies > 1 else "1 copy"
+    await update.effective_message.reply_text(f"⚙️ Next print: {mode}, {count}")
 
 
 async def print_msg(update, context):
-    logger.info("Received message from %s", update.effective_user.username)
+    """Handle incoming photo or document and send it to the printer."""
+    user = update.effective_user
+    logger.info(
+        "Received message from user_id=%s username=%s",
+        user.id,
+        user.username or "N/A",
+    )
 
+    # Determine file and original extension
     file = None
+    orig_ext = ""
     if update.effective_message.photo:
         photo = max(update.effective_message.photo, key=lambda x: x.file_size)
         file = await photo.get_file()
+        orig_ext = ".jpg"  # Telegram photos are always JPEG
     elif update.effective_message.document:
-        file = await update.effective_message.document.get_file()
+        doc = update.effective_message.document
+        orig_ext = os.path.splitext(doc.file_name)[1] if doc.file_name else ""
+        file = await doc.get_file()
 
     if file is None:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="❌ Could not find a printable file in your message.",
+        await update.effective_message.reply_text(
+            "❌ Could not find a printable file in your message."
         )
         return
 
     os.makedirs(DATA_DIR, exist_ok=True)
-    file_path = os.path.join(DATA_DIR, str(int(time.time())))
+    file_path = os.path.join(DATA_DIR, f"{int(time.time())}{orig_ext}")
     await file.download_to_drive(file_path)
     logger.info("File saved at %s", file_path)
 
     chat_id = update.effective_chat.id
-    opts = print_options.pop(chat_id, {"color": True, "copies": 1})
+    opts = pop_print_options(chat_id)
     color = opts["color"]
     copies = opts["copies"]
 
+    success = False
     try:
         await print_file(file_path, color=color, copies=copies)
-        await context.bot.send_message(
-            chat_id=chat_id, text="✅ Sent to printer!"
+        success = True
+        await update.effective_message.reply_text("✅ Sent to printer!")
+
+    except RuntimeError as e:
+        logger.error("Print failed: %s", e)
+        cmd_used = getattr(e, "cmd", None)
+        msg = f"❌ Print failed: {e}"
+        if cmd_used:
+            msg += f"\n\nCommand used:\n{cmd_used}"
+        await update.effective_message.reply_text(msg)
+
+    except Exception as e:
+        logger.exception("Unexpected error during print: %s", e)
+        await update.effective_message.reply_text(
+            f"❌ Unexpected error: {e}"
         )
+
+    finally:
         try:
             os.remove(file_path)
             logger.info("Cleaned up %s", file_path)
         except OSError as e:
             logger.warning("Could not remove %s: %s", file_path, e)
-        notify_homeassistant(
-            file_name=os.path.basename(file_path),
-            chat_id=chat_id,
-            copies=copies,
-            color=color,
-        )
-    except Exception as e:
-        logger.error("Print failed: %s", e)
-        cmd_used = getattr(e, "cmd", None)
-        if cmd_used:
-            msg = f"❌ Print failed: {e}\n\nCommand used:\n{cmd_used}"
-        else:
-            msg = f"❌ Print failed: {e}"
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=msg,
-        )
+
+        if success:
+            notify_homeassistant(
+                file_name=os.path.basename(file_path),
+                chat_id=chat_id,
+                copies=copies,
+                color=color,
+            )
 
 
-async def print_file(file_path, color=True, copies=1):
+# ---------------------------------------------------------------------------
+# Core print logic
+# ---------------------------------------------------------------------------
+
+async def print_file(file_path: str, color: bool = True, copies: int = 1) -> str:
     """Send a file to the printer using lp.
 
     Always passes -h <CUPS_SERVER> and -d <PRINTER_NAME> explicitly.
-    Both environment variables are required for correct operation.
+    Both environment variables are required — raises RuntimeError if missing.
+
+    Returns the shell command string that was executed.
     """
     lp = shutil.which("lp")
     if not lp:
         raise RuntimeError("lp command not found — is cups-client installed?")
 
-    server = os.getenv("CUPS_SERVER")
-    printer = os.getenv("PRINTER_NAME")
+    server = get_cups_server()
+    printer = get_printer_name()
 
-    if not server:
-        raise RuntimeError("CUPS_SERVER environment variable is not set")
-    if not printer:
-        raise RuntimeError("PRINTER_NAME environment variable is not set")
-
-    # Build command: lp -h <server> -d <printer> [options] <file>
+    # Build: lp -h <server> -d <printer> -o fit-to-page -o media=A4 [options] <file>
     cmd = [lp, "-h", server, "-d", printer, "-o", "fit-to-page", "-o", "media=A4"]
 
     if not color:
@@ -336,28 +373,41 @@ async def print_file(file_path, color=True, copies=1):
         cmd += ["-n", str(copies)]
     cmd.append(file_path)
 
-    # Always log the exact shell command at INFO level for easy debugging
-    logger.info("Shell command: %s", " ".join(cmd))
+    cmd_str = " ".join(cmd)
+    logger.info("Shell command: %s", cmd_str)
 
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await process.communicate()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        ex = RuntimeError("lp command timed out after 30 seconds")
+        ex.cmd = cmd_str
+        raise ex
 
     if process.returncode != 0:
         err_str = stderr.decode().strip()[:MAX_STDERR_LENGTH]
-        logger.error("lp failed (returncode=%s) stderr: %s", process.returncode, stderr.decode())
+        logger.error(
+            "lp failed (returncode=%s) stderr: %s",
+            process.returncode,
+            stderr.decode(),
+        )
         ex = RuntimeError(err_str or "Print command failed")
-        ex.cmd = " ".join(cmd)
+        ex.cmd = cmd_str
         raise ex
 
     logger.info("lp stdout: %s", stdout.decode().strip())
-    return " ".join(cmd)
+    return cmd_str
 
 
-def notify_homeassistant(file_name, chat_id, copies, color):
+# ---------------------------------------------------------------------------
+# Home Assistant integration
+# ---------------------------------------------------------------------------
+
+def notify_homeassistant(file_name: str, chat_id: int, copies: int, color: bool):
     """Fire a Home Assistant event after a successful print (best-effort)."""
     ha_url = os.getenv("HA_URL")
     ha_token = os.getenv("HA_TOKEN")
@@ -387,9 +437,12 @@ def notify_homeassistant(file_name, chat_id, copies, color):
         logger.warning("Home Assistant notification failed: %s", e)
 
 
+# ---------------------------------------------------------------------------
+# Startup / lifecycle
+# ---------------------------------------------------------------------------
+
 async def post_init(application):
-    """Register bot commands and start backup/cleanup tasks."""
-    # Register commands in the Telegram menu
+    """Register bot commands and start background tasks."""
     await application.bot.set_my_commands([
         BotCommand("start", "Show the welcome message"),
         BotCommand("help", "Show available commands"),
@@ -398,23 +451,33 @@ async def post_init(application):
         BotCommand("cancel", "Cancel all print jobs"),
         BotCommand("clean", "Delete cached files (allowed users only)"),
     ])
-    
-    # Start periodic cleanup task (every 6 hours)
-    asyncio.create_task(cleanup_task())
+
+    # Start periodic cleanup task — track it so exceptions are not silently lost
+    task = asyncio.create_task(cleanup_task())
+    task.add_done_callback(_on_cleanup_task_done)
     logger.info("Periodic cleanup task started (6h interval)")
+
+
+def _on_cleanup_task_done(task: asyncio.Task):
+    """Log if the background cleanup task crashes unexpectedly."""
+    if not task.cancelled() and task.exception():
+        logger.error("Cleanup task crashed: %s", task.exception())
+
 
 async def cleanup_task():
     """Background task to periodically clean up the data directory."""
     while True:
-        await asyncio.sleep(6 * 3600)  # 6 hours
+        await asyncio.sleep(6 * 3600)  # every 6 hours
         logger.info("Running periodic data cleanup...")
         try:
-            perform_cleanup()
+            removed = perform_cleanup()
+            logger.info("Periodic cleanup removed %s file(s)", removed)
         except Exception as e:
             logger.error("Periodic cleanup failed: %s", e)
 
-def perform_cleanup():
-    """Shared logic for deleting cached files."""
+
+def perform_cleanup() -> int:
+    """Delete all cached files from the data directory. Returns count removed."""
     removed = 0
     if os.path.exists(DATA_DIR):
         for filename in os.listdir(DATA_DIR):
@@ -428,6 +491,10 @@ def perform_cleanup():
     return removed
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main():
     token = os.getenv("TOKEN")
     if not token:
@@ -436,7 +503,16 @@ def main():
 
     allowed_chat_ids = get_allowed_chat_ids()
 
-    # Perform startup cleanup
+    # Log configuration at startup for easy debugging
+    logger.info("PrintBot v%s starting...", VERSION)
+    logger.info(
+        "Configuration: CUPS_SERVER=%s  PRINTER_NAME=%s",
+        os.getenv("CUPS_SERVER", "(not set)"),
+        os.getenv("PRINTER_NAME", "(not set)"),
+    )
+    logger.info("Allowed chat IDs: %s", allowed_chat_ids or "ALL")
+
+    # Clean up any stale files from a previous run
     logger.info("Performing startup cleanup...")
     perform_cleanup()
 
@@ -447,10 +523,12 @@ def main():
         .build()
     )
 
+    # Public commands (no access restriction)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status))
 
+    # Restricted commands and message handlers
     if allowed_chat_ids:
         chat_id_filter = filters.Chat(chat_id=allowed_chat_ids)
     else:
@@ -460,15 +538,9 @@ def main():
         )
         chat_id_filter = filters.ALL
 
-    application.add_handler(
-        CommandHandler("jobs", jobs_command, filters=chat_id_filter)
-    )
-    application.add_handler(
-        CommandHandler("cancel", cancel_command, filters=chat_id_filter)
-    )
-    application.add_handler(
-        CommandHandler("clean", clean, filters=chat_id_filter)
-    )
+    application.add_handler(CommandHandler("jobs", jobs_command, filters=chat_id_filter))
+    application.add_handler(CommandHandler("cancel", cancel_command, filters=chat_id_filter))
+    application.add_handler(CommandHandler("clean", clean, filters=chat_id_filter))
 
     application.add_handler(
         MessageHandler(
@@ -488,9 +560,6 @@ def main():
         )
     )
 
-    logger.info("PrintBot v%s starting...", VERSION)
-    logger.info("Configuration: CUPS_SERVER=%s, PRINTER_NAME=%s", os.getenv("CUPS_SERVER", "localhost"), os.getenv("PRINTER_NAME", "DEFAULT"))
-    logger.info("Allowed chat IDs: %s", allowed_chat_ids or "ALL")
     application.run_polling()
 
 
