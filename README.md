@@ -8,18 +8,20 @@
 
 ## Overview
 
-PrintBot is a Telegram bot that sends photos and documents straight to a CUPS-connected printer. Run it on a Raspberry Pi (or any Linux box) as a systemd service or Docker container, then print anything from your phone by just sending it to the bot.
+PrintBot is a Telegram bot that sends photos and documents straight to a CUPS-connected printer. Run it on a Raspberry Pi (or any Linux box) as a systemd service or a Docker container, then print anything from your phone by just sending it to the bot.
 
 **Key features**
 
 - 📄 Print photos and documents sent via Telegram
 - ⚙️ Print options — send `bw`, `2x`, `3x`, `4x` before a file to customise the print
 - 🔒 Access control via numeric chat IDs (`ALLOWED_CHAT_IDS`)
-- 🖨️ CUPS integration — uses the `lp` command under the hood
+- 🖨️ CUPS integration — uses `lp` with explicit `-h <server>` and `-d <printer>` flags
+- 🌐 Remote CUPS server support — connects over TCP port 631
 - 🟢 `/status` command to check live printer availability
 - 📭 `/jobs` and `/cancel` commands for queue management
 - 🏠 Optional Home Assistant webhook after each print
 - 🐳 Docker (multi-arch: amd64 & arm64) and systemd deployment options
+- 🪵 Configurable log level via `LOG_LEVEL` env var
 - ✅ No shell injection — all commands use argument lists
 
 ---
@@ -28,14 +30,14 @@ PrintBot is a Telegram bot that sends photos and documents straight to a CUPS-co
 
 ### 1. Prerequisites
 
-- A printer configured in CUPS (`http://localhost:631`)
+- A printer configured in CUPS (`http://<cups-host>:631`)
 - A Telegram Bot token from [@BotFather](https://t.me/BotFather)
 - Your Telegram chat ID — send a message to [@userinfobot](https://t.me/userinfobot) to find it
 
 For **systemd** deployment, you also need:
 
 ```bash
-sudo apt-get install hplip cups python3 python3-pip
+sudo apt-get install cups-client python3 python3-pip
 ```
 
 For **Docker** deployment:
@@ -57,11 +59,13 @@ cp .env.example .env
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `TOKEN` | ✅ Yes | Telegram Bot API token from [@BotFather](https://t.me/BotFather) |
+| `CUPS_SERVER` | ✅ Yes | CUPS server hostname or IP (e.g. `cups` or `192.168.1.100`). Default: `cups`. |
+| `PRINTER_NAME` | ✅ Yes | Printer name as registered in CUPS (e.g. `Canon_LBP7110Cw`). Run `lpstat -v` to list available printers. |
 | `ALLOWED_CHAT_IDS` | ❌ No | Comma-separated numeric chat IDs permitted to print/clean. **If unset, anyone can print.** Find your ID via [@userinfobot](https://t.me/userinfobot). |
-| `CUPS_SERVER` | ❌ No | CUPS server address (e.g. `cups` or `192.168.1.100`). Default is `cups`. |
-| `PRINTER_NAME` | ❌ No | Specific printer name to use (e.g. `Canon_LBP7110Cw`). If unset, CUPS uses the server's default printer. |
-| `HA_URL` | ❌ No | Home Assistant base URL (e.g. `http://homeassistant:8123`). Required together with `HA_TOKEN` for webhook integration. |
-| `HA_TOKEN` | ❌ No | Home Assistant long-lived access token. Required together with `HA_URL` for webhook integration. |
+| `LOG_LEVEL` | ❌ No | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`. Default: `INFO`. |
+| `HA_URL` | ❌ No | Home Assistant base URL (e.g. `http://homeassistant:8123`). Required together with `HA_TOKEN`. |
+| `HA_TOKEN` | ❌ No | Home Assistant long-lived access token. Required together with `HA_URL`. |
+| `TZ` | ❌ No | Timezone for container logs (e.g. `Asia/Bangkok`). Default: UTC. |
 
 ---
 
@@ -72,9 +76,17 @@ cp .env.example .env
 ```bash
 git clone https://github.com/zr0aces/printbot.git
 cd printbot
-cp .env.example .env   # fill in TOKEN and ALLOWED_CHAT_IDS
-docker compose up -d --build
+cp .env.example .env   # fill in TOKEN, CUPS_SERVER, PRINTER_NAME
+docker compose up -d
 docker compose logs -f
+```
+
+The `docker-compose.yml` pulls directly from GitHub Container Registry — no local build required.
+
+To build locally instead:
+
+```bash
+docker compose up -d --build
 ```
 
 #### Option B — systemd Service (Raspberry Pi / Linux)
@@ -83,7 +95,7 @@ docker compose logs -f
 git clone https://github.com/zr0aces/printbot.git /home/pi/printbot
 cd /home/pi/printbot
 pip install -r requirements.txt
-cp .env.example .env   # fill in TOKEN and ALLOWED_CHAT_IDS
+cp .env.example .env   # fill in TOKEN, CUPS_SERVER, PRINTER_NAME
 
 sudo cp printbot.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -91,14 +103,16 @@ sudo systemctl enable --now printbot.service
 sudo systemctl status printbot.service
 ```
 
+> **Note:** The `printbot.service` file assumes the user `pi` and path `/home/pi/printbot`. Adjust `User=` and `WorkingDirectory=` as needed.
+
 #### Option C — Run directly
 
 ```bash
 git clone https://github.com/zr0aces/printbot.git
 cd printbot
 pip install -r requirements.txt
-cp .env.example .env   # fill in TOKEN and ALLOWED_CHAT_IDS
-python bot.py
+cp .env.example .env   # fill in TOKEN, CUPS_SERVER, PRINTER_NAME
+python3 bot.py
 ```
 
 ---
@@ -123,15 +137,15 @@ Once the bot is running, open it in Telegram and:
 
 #### Print Options
 
-Before sending a file, you can text the bot with options for the next print:
+Before sending a file, text the bot with one or more options for the **next** print:
 
 | Option | Effect |
 |--------|--------|
 | `bw` or `gray` | Print in black & white |
 | `2x`, `3x`, `4x` | Print multiple copies |
-| `bw 2x` | Combine options |
+| `bw 2x` | Combine: B&W + 2 copies |
 
-Options apply to the **next** file only, then reset to defaults (colour, 1 copy).
+Options apply to the **next** file only, then reset to defaults (colour, 1 copy). They expire after 10 minutes if no file is sent.
 
 ---
 
@@ -145,13 +159,13 @@ Pull the latest release:
 docker pull ghcr.io/zr0aces/printbot:latest
 ```
 
-Or pin to a specific version:
+Pin to a specific version:
 
 ```bash
-docker pull ghcr.io/zr0aces/printbot:1.0.0
+docker pull ghcr.io/zr0aces/printbot:1.0.5
 ```
 
-Or use a major.minor tag to track patch updates:
+Track minor-version patch updates:
 
 ```bash
 docker pull ghcr.io/zr0aces/printbot:1.0
@@ -167,8 +181,8 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 |-----------|---------|
 | Python | 3.12 |
 | [python-telegram-bot](https://python-telegram-bot.org/) | 22.7 |
-| CUPS client (`lp` / `lpstat`) | System package |
-| Docker base image | `python:3.12-slim` |
+| CUPS client (`lp` / `lpstat` / `cancel`) | System package |
+| Docker base image | `ubuntu:22.04` |
 
 ---
 
@@ -176,13 +190,14 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 | Problem | Solution |
 |---------|----------|
-| Printer not detected | Check CUPS at `http://localhost:631`; ensure the printer is added and enabled |
-| Bot not responding | Verify `TOKEN` in `.env` is correct and the bot process is running |
-| `/status` shows no printers | Run `lpstat -p` on the host to confirm CUPS sees your printer |
-| Permission issues | Ensure the running user is in the `lpadmin` group |
-| Docker can't reach printer | Confirm `/dev/usb/lp0` and `/var/run/cups/cups.sock` are forwarded in `docker-compose.yml` |
+| `No default destination` error | Ensure `PRINTER_NAME` is set and matches a printer registered on the CUPS server (`lpstat -v -h <server>`). |
+| Printer not detected | Check CUPS at `http://<cups-host>:631`; ensure the printer is added and enabled. |
+| Bot not responding | Verify `TOKEN` in `.env` is correct and the bot process is running (`docker compose logs printbot`). |
+| `/status` shows no printers | Run `lpstat -p -h <cups-host>` on the host to confirm CUPS sees your printer. |
+| Connection refused on port 631 | Make sure the CUPS container/service exposes port 631 and `CUPS_SERVER` points to the correct host. |
+| Permission issues (systemd) | Ensure the running user is in the `lpadmin` group (`sudo usermod -aG lpadmin $USER`). |
+| Canon driver not found | Verify the PPD file `CNRCUPSLBP7110CZNK.ppd` is installed in `/usr/share/cups/model/` on the CUPS server. |
 
 ---
 
 Contributions and issues are welcome!
-

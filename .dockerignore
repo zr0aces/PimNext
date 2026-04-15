@@ -1,15 +1,40 @@
+# ── Git metadata ─────────────────────────────────────────────────────────────
 .git
 .gitignore
+.github
+
+# ── Secrets & local config ───────────────────────────────────────────────────
 .env
 .env.*
 !.env.example
+
+# ── Editor / IDE ─────────────────────────────────────────────────────────────
 .vscode/
+.idea/
+
+# ── Runtime data ─────────────────────────────────────────────────────────────
 data/
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+
+# ── Documentation (not needed at runtime) ────────────────────────────────────
+README.md
+CHANGELOG.md
+CONTRIBUTING.md
+*.md
+
+# ── Systemd unit (host-side only) ────────────────────────────────────────────
+printbot.service
+
+# ── Legacy ───────────────────────────────────────────────────────────────────
 Pipfile
 Pipfile.lock
-CHANGELOG.md
-README.md
-printbot.service
-__pycache__/
-*.pyc
-*.pyo

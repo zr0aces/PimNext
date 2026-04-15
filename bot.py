@@ -31,7 +31,7 @@ logger = logging.getLogger("printbot")
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "1.0.0"
+VERSION = "1.0.5"
 DATA_DIR = "data"
 
 # Maximum characters of stderr to include in error replies
