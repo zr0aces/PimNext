@@ -53,6 +53,9 @@ PRINTABLE_EXTENSIONS = {
     ".doc", ".docx", ".odt",
 }
 
+# Pre-sorted display string — reused in every unsupported-type error reply
+PRINTABLE_EXTENSIONS_DISPLAY = ", ".join(sorted(PRINTABLE_EXTENSIONS))
+
 # Per-chat print options: {chat_id: {"color": bool, "copies": int, "media": str, "number_up": int, "ts": float}}
 # Entries expire after PRINT_OPTIONS_TTL seconds.
 print_options: dict[int, dict] = {}
@@ -156,14 +159,14 @@ HELP_TEXT = (
     "/status — Check printer availability\n"
     "/jobs — Show the print queue\n"
     "/cancel — Cancel all print jobs\n"
-    "/clean — Delete cached files (allowed users only)\n\n"
+    "/clean — Delete cached files (allowed users only)\n"
+    "/print — Print queued half-mode files now\n\n"
     "Send a *photo* or *document* to print it.\n\n"
     "*Print options* — send before your file:\n"
     "  `bw` or `gray` — black & white\n"
     "  `2x`, `3x`, `4x` — multiple copies\n"
     "  `a4`, `a5` — specific paper size\n"
-    "  `half` — queue files and print 2 per sheet (2 files = 1 sheet); send `print` to flush early\n"
-    "  `print` — print queued half-mode files now\n"
+    "  `half` — queue files and print 2 per sheet (2 files = 1 sheet); send `/print` to flush early\n"
     "  `bw half` — B&W half-sheet (common combo)\n"
     "  `bw 2x a5` — combine options\n\n"
     "_Settings persist for 30 minutes._"
@@ -370,7 +373,7 @@ async def _get_file_info(update: Update) -> tuple | None:
     msg = update.effective_message
 
     if msg.photo:
-        photo = max(msg.photo, key=lambda x: x.file_size)
+        photo = max(msg.photo, key=lambda x: x.file_size or 0)
         if photo.file_size and photo.file_size > MAX_FILE_BYTES:
             await msg.reply_text(
                 f"❌ File too large ({photo.file_size // 1024 // 1024} MB). Maximum is 20 MB."
@@ -383,10 +386,9 @@ async def _get_file_info(update: Update) -> tuple | None:
         doc = msg.document
         orig_ext = os.path.splitext(doc.file_name)[1].lower() if doc.file_name else ""
         if orig_ext not in PRINTABLE_EXTENSIONS:
-            ext_list = ", ".join(sorted(PRINTABLE_EXTENSIONS))
             await msg.reply_text(
                 f"❌ Unsupported file type `{orig_ext or '(none)'}`. "
-                f"Supported: {ext_list}",
+                f"Supported: {PRINTABLE_EXTENSIONS_DISPLAY}",
                 parse_mode="Markdown",
             )
             return None
@@ -548,14 +550,15 @@ async def print_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    # Claim the rate-limit slot before yielding to the event loop so a second
+    # concurrent message for the same chat cannot slip through the check above.
+    last_print_time[chat_id] = time.monotonic()
+
     file_info = await _get_file_info(update)
     if file_info is None:
         return
 
     file_obj, orig_ext = file_info
-
-    # ── Commit to printing — record timestamp for rate limiting ──────────────
-    last_print_time[chat_id] = time.monotonic()
 
     # Use a UUID-based filename to prevent collisions under concurrent prints
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -722,6 +725,7 @@ async def post_init(application) -> None:
         BotCommand("jobs", "Show the print queue"),
         BotCommand("cancel", "Cancel all print jobs"),
         BotCommand("clean", "Delete cached files (allowed users only)"),
+        BotCommand("print", "Print queued half-mode files now"),
     ])
 
     # Start periodic cleanup task — track it so exceptions are not silently lost
@@ -751,6 +755,16 @@ async def cleanup_task() -> None:
             print_options.pop(cid, None)
         if expired_chats:
             logger.info("Evicted %d expired print option(s).", len(expired_chats))
+
+        # Evict stale last_print_time entries (prevents unbounded growth)
+        stale_rate = [
+            cid for cid, ts in last_print_time.items()
+            if (now - ts) >= PRINT_OPTIONS_TTL
+        ]
+        for cid in stale_rate:
+            last_print_time.pop(cid, None)
+        if stale_rate:
+            logger.info("Evicted %d stale rate-limit entry(ies).", len(stale_rate))
 
         # Evict expired half-queue entries and delete their files
         expired_half = [
@@ -872,6 +886,7 @@ def main() -> None:
     application.add_handler(CommandHandler("jobs", jobs_command, filters=chat_id_filter))
     application.add_handler(CommandHandler("cancel", cancel_command, filters=chat_id_filter))
     application.add_handler(CommandHandler("clean", clean, filters=chat_id_filter))
+    application.add_handler(CommandHandler("print", print_command, filters=chat_id_filter))
 
     application.add_handler(
         MessageHandler(
