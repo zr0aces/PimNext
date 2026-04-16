@@ -376,6 +376,7 @@ async def _get_file_info(update: Update) -> tuple | None:
     msg = update.effective_message
 
     if msg.photo:
+        # `if msg.photo:` guarantees a non-empty list here, so [-1] is safe.
         # Telegram sends photos ordered smallest → largest; pick the largest with a known size.
         # Fall back to the last entry (largest by Telegram's ordering) if all sizes are None.
         photos_with_size = [p for p in msg.photo if p.file_size is not None]
