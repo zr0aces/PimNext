@@ -195,6 +195,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not LPSTAT_BIN:
         await update.effective_message.reply_text(
             "⚠️ CUPS client tools (`lpstat`) not found on this system.",
+            parse_mode="Markdown",
         )
         return
 
@@ -225,6 +226,7 @@ async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not LPSTAT_BIN:
         await update.effective_message.reply_text(
             "⚠️ CUPS client tools (`lpstat`) not found on this system.",
+            parse_mode="Markdown",
         )
         return
 
@@ -256,6 +258,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not CANCEL_BIN:
         await update.effective_message.reply_text(
             "⚠️ CUPS client tools (`cancel`) not found on this system.",
+            parse_mode="Markdown",
         )
         return
 
@@ -419,6 +422,12 @@ async def _flush_half_queue(
     if not entry or not entry.get("files"):
         await update.effective_message.reply_text("❓ No files are queued for printing.")
         return
+
+    # Files in the half queue were always queued in half mode; ensure opts reflect that
+    # even if the 30-minute TTL has since expired and get_print_options returned defaults.
+    if opts.get("number_up", 1) != 2:
+        opts = dict(opts)
+        opts["number_up"] = 2
 
     # ── Rate limiting ────────────────────────────────────────────────────────
     now = time.monotonic()
