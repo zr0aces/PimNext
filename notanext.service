@@ -1,11 +1,11 @@
 [Unit]
-Description=PimNext - Telegram bot for printing
+Description=NotaNext - Telegram bot for printing
 After=cups.service
 
 [Service]
-EnvironmentFile=/home/pi/pimnext/.env
+EnvironmentFile=/home/pi/notanext/.env
 User=pi
-WorkingDirectory=/home/pi/pimnext
+WorkingDirectory=/home/pi/notanext
 ExecStart=/usr/bin/python3 bot.py
 Restart=on-failure
 RestartSec=10
@@ -18,7 +18,7 @@ PrivateTmp=yes
 # Make the OS filesystem read-only except for explicitly listed paths
 ProtectSystem=strict
 # Allow writing only to the data directory for downloaded print files
-ReadWritePaths=/home/pi/pimnext/data
+ReadWritePaths=/home/pi/notanext/data
 # Restrict access to home directories of other users
 ProtectHome=read-only
 

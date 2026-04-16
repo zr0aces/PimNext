@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.1] – 2026-04-16
+
+### Changed
+- **Project renamed from PimNext to NotaNext**: updated all references across the codebase and configuration files.
+
+### Fixed
+- **Half mode multi-file printing**: Files sent in half mode are now mathematically merged into a single PDF before passing to CUPS. This reliably forces CUPS to place exactly 2 distinct submissions side-by-side on exactly half of one physical sheet. Previously, CUPS would automatically separate them and place them on individual pages.
+
+---
+
 ## [1.1.0] – 2026-04-16
 
 ### Changed

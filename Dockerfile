@@ -2,9 +2,9 @@ FROM ubuntu:22.04
 
 ARG VERSION=dev
 
-LABEL org.opencontainers.image.title="PimNext" \
+LABEL org.opencontainers.image.title="NotaNext" \
       org.opencontainers.image.description="Telegram bot that sends files to a CUPS printer" \
-      org.opencontainers.image.source="https://github.com/zr0aces/PimNext" \
+      org.opencontainers.image.source="https://github.com/zr0aces/NotaNext" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.licenses="MIT"
 

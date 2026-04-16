@@ -33,13 +33,13 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
-logger = logging.getLogger("pimnext")
+logger = logging.getLogger("notanext")
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 DATA_DIR = "data"
 
 # Maximum characters of stderr to include in error replies
@@ -156,7 +156,7 @@ async def run_cups_command(cmd: list[str], timeout: int = 5) -> tuple[str, str, 
 # ---------------------------------------------------------------------------
 
 HELP_TEXT = (
-    "📠 *PimNext Commands*\n\n"
+    "📠 *NotaNext Commands*\n\n"
     "/start — Show the welcome message\n"
     "/help — Show this help message\n"
     "/status — Check printer availability\n"
@@ -182,7 +182,7 @@ HELP_TEXT = (
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "👋 Welcome to *PimNext*!\n\n"
+        "👋 Welcome to *NotaNext*!\n\n"
         "Send me a photo or document and I'll print it for you.\n\n"
         "Use /help to see all available commands.",
         parse_mode="Markdown",
@@ -740,7 +740,7 @@ async def notify_homeassistant(
     if not ha_url or not ha_token:
         return
 
-    url = f"{ha_url}/api/events/pimnext_job_sent"
+    url = f"{ha_url}/api/events/notanext_job_sent"
     payload = {
         "file_name": file_name,
         "chat_id": chat_id,
@@ -889,7 +889,7 @@ def main() -> None:
     allowed_chat_ids = get_allowed_chat_ids()
 
     # Log configuration at startup for easy debugging
-    logger.info("PimNext v%s starting...", VERSION)
+    logger.info("NotaNext v%s starting...", VERSION)
     logger.info(
         "Configuration: CUPS_SERVER=%s  PRINTER_NAME=%s",
         os.getenv("CUPS_SERVER", "(not set)"),
