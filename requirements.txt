@@ -3,3 +3,5 @@ python-telegram-bot==22.7
 # for async HTTP calls (Home Assistant webhook). Pinned to match what
 # python-telegram-bot 22.7 pulls in and avoid silent breakage on version drift.
 httpx==0.28.1
+Pillow==10.2.0
+pypdf==4.1.0

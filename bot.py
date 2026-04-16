@@ -4,8 +4,11 @@ import shutil
 import time
 import logging
 import uuid
+import io
 
 import httpx
+from PIL import Image
+from pypdf import PdfWriter, PdfReader
 from telegram import BotCommand, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
@@ -613,6 +616,32 @@ async def print_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Core print logic
 # ---------------------------------------------------------------------------
 
+def merge_to_pdf(file_paths: list[str], output_path: str) -> None:
+    """Merge images and PDFs into a single monolithic PDF document."""
+    writer = PdfWriter()
+    
+    for fp in file_paths:
+        ext = fp.lower().split('.')[-1]
+        if ext in ('jpg', 'jpeg', 'png', 'gif'):
+            img = Image.open(fp)
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            img_pdf = io.BytesIO()
+            img.save(img_pdf, format='PDF')
+            img_pdf.seek(0)
+            reader = PdfReader(img_pdf)
+            for page in reader.pages:
+                writer.add_page(page)
+        elif ext == 'pdf':
+            reader = PdfReader(fp)
+            for page in reader.pages:
+                writer.add_page(page)
+        else:
+            raise RuntimeError(f"Half mode merging is only supported for Images and PDFs. Found: .{ext}")
+            
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
 async def print_file(file_paths: list[str], color: bool = True, copies: int = 1, media: str = "A4", number_up: int = 1) -> str:
     """Send one or more files to the printer using lp.
 
@@ -630,6 +659,14 @@ async def print_file(file_paths: list[str], color: bool = True, copies: int = 1,
     if not file_paths:
         raise RuntimeError("Internal error: print_file called with empty file list")
 
+    merged_path = None
+    if len(file_paths) > 1 and number_up > 1:
+        merged_path = os.path.join(DATA_DIR, f"{uuid.uuid4().hex}_merged.pdf")
+        await asyncio.to_thread(merge_to_pdf, file_paths, merged_path)
+        print_paths = [merged_path]
+    else:
+        print_paths = list(file_paths)
+
     server = get_cups_server()
     printer = get_printer_name()
 
@@ -643,7 +680,7 @@ async def print_file(file_paths: list[str], color: bool = True, copies: int = 1,
         cmd += ["-o", "ColorModel=Gray", "-o", "CNColorMode=mono"]
     if copies > 1:
         cmd += ["-n", str(copies)]
-    cmd.extend(file_paths)
+    cmd.extend(print_paths)
 
     cmd_str = " ".join(cmd)
     logger.info("Shell command: %s", cmd_str)
@@ -654,28 +691,37 @@ async def print_file(file_paths: list[str], color: bool = True, copies: int = 1,
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
-    except asyncio.TimeoutError:
-        # Kill and reap the process to prevent zombie / fd leak
-        process.kill()
-        await process.wait()
-        ex = RuntimeError("lp command timed out after 30 seconds")
-        ex.cmd = cmd_str  # type: ignore[attr-defined]
-        raise ex
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            # Kill and reap the process to prevent zombie / fd leak
+            process.kill()
+            await process.wait()
+            ex = RuntimeError("lp command timed out after 30 seconds")
+            ex.cmd = cmd_str  # type: ignore[attr-defined]
+            raise ex
+    
+        if process.returncode != 0:
+            err_str = stderr.decode().strip()[:MAX_STDERR_LENGTH]
+            logger.error(
+                "lp failed (returncode=%s) stderr: %s",
+                process.returncode,
+                stderr.decode(),
+            )
+            ex = RuntimeError(err_str or "Print command failed")
+            ex.cmd = cmd_str  # type: ignore[attr-defined]
+            raise ex
+    
+        logger.info("lp stdout: %s", stdout.decode().strip())
+        return cmd_str
+    finally:
+        if merged_path:
+            try:
+                os.remove(merged_path)
+                logger.info("Cleaned up merged file %s", merged_path)
+            except OSError as e:
+                logger.warning("Could not remove merged file %s: %s", merged_path, e)
 
-    if process.returncode != 0:
-        err_str = stderr.decode().strip()[:MAX_STDERR_LENGTH]
-        logger.error(
-            "lp failed (returncode=%s) stderr: %s",
-            process.returncode,
-            stderr.decode(),
-        )
-        ex = RuntimeError(err_str or "Print command failed")
-        ex.cmd = cmd_str  # type: ignore[attr-defined]
-        raise ex
-
-    logger.info("lp stdout: %s", stdout.decode().strip())
-    return cmd_str
 
 
 # ---------------------------------------------------------------------------
