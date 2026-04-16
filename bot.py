@@ -164,6 +164,7 @@ HELP_TEXT = (
     "  `a4`, `a5` — specific paper size\n"
     "  `half` — queue files and print 2 per sheet (2 files = 1 sheet); send `print` to flush early\n"
     "  `print` — print queued half-mode files now\n"
+    "  `bw half` — B&W half-sheet (common combo)\n"
     "  `bw 2x a5` — combine options\n\n"
     "_Settings persist for 30 minutes._"
 )
@@ -450,6 +451,11 @@ async def _flush_half_queue(
         await update.effective_message.reply_text(
             f"✅ Sent {file_count} file(s) to printer! "
             f"(~{sheet_count} sheet{'s' if sheet_count != 1 else ''})"
+            + (
+                "\n_(Half mode still active — send your next file when ready.)_"
+                if opts.get("number_up", 1) == 2 else ""
+            ),
+            parse_mode="Markdown",
         )
 
     except RuntimeError as e:
