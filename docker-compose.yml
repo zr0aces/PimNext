@@ -23,6 +23,11 @@ services:
         reservations:
           cpus: '0.10'
           memory: 128M
+    volumes:
+      # Persist the preferences file (data/preferences.json) across container
+      # recreations.  The host directory is created automatically by Docker if
+      # it does not yet exist.
+      - ./data:/app/data
     # Prevent unbounded log growth on long-running hosts (e.g. Raspberry Pi SD card)
     logging:
       driver: "json-file"
