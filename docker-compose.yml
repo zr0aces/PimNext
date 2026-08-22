@@ -2,17 +2,15 @@ services:
   notanext:
     # Default: pulls the pre-built image from GitHub Container Registry.
     # To build locally instead, run: docker compose up -d --build
-    image: ${DOCKER_IMAGE:-ghcr.io/zr0aces/notanext:1.1.3}
+    image: ${DOCKER_IMAGE:-ghcr.io/zr0aces/notanext:1.2.0}
     build:
       context: .
       args:
-        VERSION: "1.1.3"
+        VERSION: "1.2.0"
     container_name: notanext
     restart: always
-    environment:
-      - CUPS_SERVER=cups
-      - PRINTER_NAME=Canon_LBP7110Cw
-      - TZ=Asia/Bangkok
+    # All configuration comes from .env so that editing it actually takes
+    # effect. A hardcoded `environment:` block would silently override env_file.
     env_file:
       - .env
     deploy:

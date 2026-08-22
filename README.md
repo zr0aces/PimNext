@@ -13,7 +13,7 @@ NotaNext is a Telegram bot that sends photos and documents straight to a CUPS-co
 **Key features**
 
 - 📄 Print photos and documents sent via Telegram
-- ⚙️ Print options — send `bw`, `2x`, `3x`, `4x` before a file to customise the print
+- ⚙️ Print options — send `bw`, `1x`–`4x`, `a4`/`a5`, `half` before a file to customise the print
 - 🧩 Guided `/preferences` wizard to save per-chat default print settings
 - 🔒 Access control via numeric chat IDs (`ALLOWED_CHAT_IDS`)
 - 🖨️ CUPS integration — uses `lp` with explicit `-h <server>` and `-d <printer>` flags
@@ -70,6 +70,8 @@ chmod 600 .env   # restrict read access — .env contains your Telegram token
 | `HA_URL` | ❌ No | Home Assistant base URL (e.g. `http://homeassistant:8123`). Required together with `HA_TOKEN`. |
 | `HA_TOKEN` | ❌ No | Home Assistant long-lived access token. Required together with `HA_URL`. |
 | `TZ` | ❌ No | Timezone for container logs (e.g. `Asia/Bangkok`). Default: UTC. |
+| `MAX_PREFERENCES` | ❌ No | Maximum number of chats whose saved defaults are stored on disk. Must be a positive integer. Default: `10`. |
+| `DOCKER_IMAGE` | ❌ No | Image used by `docker-compose.yml`. Set it to use a local tag or a different registry. Default: `ghcr.io/zr0aces/notanext:1.2.0`. |
 
 ---
 
@@ -133,12 +135,12 @@ Once the bot is running, open it in Telegram and:
 
 | Command | Description | Who can use |
 |---------|-------------|-------------|
-| `/start` | Show the welcome message | Everyone |
+| `/start` | Show the welcome message and open the preferences wizard | Allowed chat IDs only |
 | `/help` | List available commands | Everyone |
-| `/preferences` | Set persistent default print preferences (color/B&W, normal/half, A4/A5) | Everyone |
+| `/preferences` | Set persistent default print preferences (color/B&W, normal/half, A4/A5) | Allowed chat IDs only |
 | `/status` | Check printer availability via CUPS | Everyone |
 | `/jobs` | Show the current print queue | Allowed chat IDs only |
-| `/cancel` | Cancel all pending print jobs | Allowed chat IDs only |
+| `/cancel` | Cancel all pending print jobs — or, while the `/preferences` wizard is open, abort the wizard | Allowed chat IDs only |
 | `/clean` | Delete cached downloaded files | Allowed chat IDs only |
 
 #### Default Preferences
@@ -158,14 +160,30 @@ Before sending a file, text the bot with one or more options for the **next** pr
 | Option | Effect |
 |--------|--------|
 | `bw` or `gray` | Print in black & white |
-| `2x`, `3x`, `4x` | Print multiple copies |
-| `a4`, `a5` | Specific paper size |
-| `half` | Print A5 content on A4 paper (half sheet layout) |
+| `color` | Print in colour |
+| `1x`, `2x`, `3x`, `4x` | Number of copies (`1x` resets to a single copy) |
+| `a4`, `a5` | Paper size |
+| `half` or `2up` | Half-sheet mode — see below |
+| `normal`, `full`, `single`, `1up` | One page per sheet (leaves half mode) |
+| `print` | Print whatever is queued in half mode right now |
 | `bw 2x a5` | Combine options |
 
-Options apply to all subsequent files for the **next 30 minutes**. They reset to defaults (colour, 1 copy, A4) after 30 minutes of inactivity.
+A message containing an unrecognised word is rejected in full — no partial settings are applied.
 
-Temporary options always override saved defaults during their 30-minute active window.
+Options apply to all subsequent files for the **next 30 minutes**, and each file you send extends that window. Once it lapses, the bot falls back to the defaults you saved with `/preferences` (or to colour, 1 copy, A4 if you never saved any). Temporary options always override saved defaults while the window is active.
+
+##### Half-sheet mode
+
+`half` prints **two pages side by side on one sheet** (`number-up=2`). It does not change the paper size — combine it with `a4` or `a5` to choose that separately.
+
+Half mode also changes the workflow: files are **queued** rather than printed immediately, so two of them can share a sheet.
+
+- Send a file → it is queued, and the bot tells you how many sheets are pending.
+- Send a second file → both print together on one sheet.
+- Send `print` at any time → whatever is queued prints now. A lone file is padded with a blank half so it still lands on half a sheet.
+- Send `normal` → half mode is switched off and any queued files are discarded.
+
+Because half mode merges files into a single PDF, it only accepts images and PDFs (`.gif`, `.jpeg`, `.jpg`, `.pdf`, `.png`). Send `normal` first to print a `.docx`, `.odt`, `.txt` or `.ps`.
 
 ---
 
@@ -178,7 +196,7 @@ Docker images are published automatically to [GitHub Container Registry](https:/
 docker pull ghcr.io/zr0aces/notanext:latest
 
 # Pin to a specific version
-docker pull ghcr.io/zr0aces/notanext:1.1.3
+docker pull ghcr.io/zr0aces/notanext:1.2.0
 ```
 
 See [docs/CHANGELOG.md](docs/CHANGELOG.md) for release notes.
@@ -191,13 +209,26 @@ See [docs/CHANGELOG.md](docs/CHANGELOG.md) for release notes.
 |-----------|---------|
 | Python | 3.12 |
 | [python-telegram-bot](https://python-telegram-bot.org/) | 22.7 |
-| [httpx](https://www.python-httpx.org/) | transitive dep (async HTTP) |
+| [httpx](https://www.python-httpx.org/) | 0.28.1 (async HTTP — Home Assistant webhook) |
+| [Pillow](https://python-pillow.org/) | 10.2.0 (image → PDF conversion for half mode) |
+| [pypdf](https://pypdf.readthedocs.io/) | 4.1.0 (PDF merging for half mode) |
 | CUPS client (`lp` / `lpstat` / `cancel`) | System package |
 | Docker base image | `ubuntu:22.04` |
 
 > **Supply-chain hardening:** To pin `requirements.txt` with SHA-256 hashes, run
 > `pip install pip-tools && pip-compile --generate-hashes requirements.txt`
 > and commit the resulting `requirements.txt` lockfile.
+
+### Self-check
+
+`test_bot.py` covers the pure logic — print-option parsing, the preference
+persistence round-trip, the half-mode extension gate, and version consistency
+between `bot.py`, `docker-compose.yml` and the changelog. It stubs the
+third-party imports, so it needs nothing installed:
+
+```bash
+python3 test_bot.py
+```
 
 ---
 

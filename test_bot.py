@@ -1,0 +1,117 @@
+"""Runnable self-check for NotaNext's pure logic.
+
+Covers the parts that would silently misbehave if broken: print-option keyword
+parsing, the PrintOptions persistence round-trip, and the half-mode extension
+gate. Everything here is pure — no printer, no network, no Telegram.
+
+The third-party modules bot.py imports are stubbed, so this runs on a bare
+interpreter with nothing installed:
+
+    python3 test_bot.py
+"""
+
+import sys
+from unittest import mock
+
+for _name in ("httpx", "PIL", "PIL.Image", "pypdf", "telegram", "telegram.ext"):
+    sys.modules.setdefault(_name, mock.MagicMock())
+
+import bot  # noqa: E402
+from bot import PrintOptions, parse_option_tokens  # noqa: E402
+
+
+def test_defaults():
+    opts = PrintOptions()
+    assert opts.color is True
+    assert opts.copies == 1
+    assert opts.media == "A4"
+    assert opts.number_up == 1
+
+
+def test_parses_every_documented_keyword():
+    """Every keyword the README and HELP_TEXT advertise must parse."""
+    documented = [
+        "bw", "gray", "color",
+        "1x", "2x", "3x", "4x",
+        "a4", "a5",
+        "half", "2up",
+        "normal", "full", "single", "1up",
+    ]
+    for token in documented:
+        assert parse_option_tokens([token], PrintOptions()), f"{token!r} was rejected"
+
+
+def test_combined_options():
+    opts = PrintOptions()
+    assert parse_option_tokens(["bw", "2x", "a5"], opts)
+    assert opts.color is False
+    assert opts.copies == 2
+    assert opts.media == "A5"
+
+
+def test_unknown_token_invalidates_whole_message():
+    opts = PrintOptions()
+    assert not parse_option_tokens(["bw", "sideways"], opts)
+
+
+def test_half_and_normal_toggle_number_up():
+    opts = PrintOptions()
+    parse_option_tokens(["half"], opts)
+    assert opts.number_up == 2
+    parse_option_tokens(["normal"], opts)
+    assert opts.number_up == 1
+
+
+def test_persistence_round_trip():
+    """to_dict/from_dict must preserve the profile and never persist `ts`."""
+    original = PrintOptions(color=False, copies=3, media="A5", number_up=2, ts=123.4)
+    encoded = original.to_dict()
+    assert "ts" not in encoded, "session timestamp must not be persisted"
+    assert PrintOptions.from_dict(encoded) == PrintOptions(
+        color=False, copies=3, media="A5", number_up=2, ts=0.0
+    )
+
+
+def test_from_dict_tolerates_missing_keys():
+    assert PrintOptions.from_dict({}) == PrintOptions()
+    assert PrintOptions.from_dict({"media": "A5"}).copies == 1
+
+
+def test_labels():
+    assert PrintOptions(color=True).color_label == "Color"
+    assert PrintOptions(color=False).color_label == "Gray (B&W)"
+    assert PrintOptions(number_up=2).mode_label == "Half sheet"
+    assert PrintOptions(number_up=1).mode_label == "Normal"
+
+
+def test_half_mode_gate_is_narrower_than_printable():
+    """Half mode merges to PDF, so it must accept less than normal printing."""
+    assert bot.MERGEABLE_EXTENSIONS < bot.PRINTABLE_EXTENSIONS
+    for ext in (".docx", ".txt", ".odt", ".doc", ".ps"):
+        assert ext in bot.PRINTABLE_EXTENSIONS
+        assert ext not in bot.MERGEABLE_EXTENSIONS
+
+
+def test_version_matches_changelog():
+    """The four places VERSION lives must not drift apart."""
+    with open("docs/CHANGELOG.md") as f:
+        changelog = f.read()
+    with open("docker-compose.yml") as f:
+        compose = f.read()
+    assert f"## [{bot.VERSION}]" in changelog, "no CHANGELOG entry for VERSION"
+    assert bot.VERSION in compose, "docker-compose.yml is pinned to another version"
+
+
+if __name__ == "__main__":
+    failures = 0
+    for name, fn in sorted(globals().items()):
+        if not name.startswith("test_") or not callable(fn):
+            continue
+        try:
+            fn()
+            print(f"  ok   {name}")
+        except AssertionError as e:
+            failures += 1
+            print(f"  FAIL {name}: {e}")
+    print(f"\n{'FAILED' if failures else 'PASSED'} — {failures} failure(s)")
+    sys.exit(1 if failures else 0)

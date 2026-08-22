@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] – 2026-08-22
+
+### Added
+- **`1x` copy option** — explicitly resets the copy count to one. Previously only `2x`–`4x` existed, so there was no way to undo a multi-copy setting without waiting out the 30-minute session.
+- **Blank-page padding in half mode** — a single file printed with `half` now gets a blank second page appended to the merged PDF, so CUPS applies a true 2-up layout on one physical sheet instead of letting the driver scale the content to a full page.
+- **`test_bot.py`** — a dependency-free self-check (`python3 test_bot.py`) covering option parsing, the preference persistence round-trip, the half-mode extension gate, and version consistency between `bot.py`, `docker-compose.yml`, and this changelog.
+- **`MAX_PREFERENCES` documented in the README** environment table, along with `DOCKER_IMAGE`. Both were already implemented but only mentioned in `.env.example`.
+
+### Fixed — Security
+- **`/start` and `/preferences` were unrestricted.** The preference wizard's entry points carried no chat filter, so any Telegram user could reach it and consume one of the `MAX_PREFERENCES` slots (default 10) — locking legitimate users out with "the preference store is full". Both entry points now use the same `ALLOWED_CHAT_IDS` filter as `/jobs`, `/cancel`, `/clean`, and the file handlers.
+
+### Fixed
+- **Half mode silently ignored unmergeable file types.** `.txt`, `.doc`, `.docx`, `.odt` and `.ps` are printable but cannot be merged into a PDF, so a `.docx` sent in half mode fell back to a plain multi-file `lp` job and printed full-page — contradicting the 1.1.1 entry below. Such files are now rejected at queue time with a message pointing at `normal` mode, and `print_file` raises rather than falling through. The mergeable set is a module constant (`MERGEABLE_EXTENSIONS`) instead of being redefined inside `print_file`.
+- **`docker-compose.yml` overrode `.env`.** `CUPS_SERVER`, `PRINTER_NAME` and `TZ` were hardcoded under `environment:`, which takes precedence over `env_file:` — so following the README's "fill in TOKEN, CUPS_SERVER, PRINTER_NAME" had no effect on the Compose path. The block is removed; all configuration now comes from `.env`.
+- **`.dockerignore` referenced `pimnext.service`**, a filename that has not existed since the 1.1.1 rename. The rule was dead and the systemd unit was being copied into the image; it now correctly excludes `notanext.service`.
+- **`/cancel` collision is no longer silent.** The command is bound both as the wizard's fallback and as the print-queue canceller; while the wizard is open the fallback wins. The cancellation reply now says to send `/cancel` again to reach the print-queue meaning.
+- **README corrections** — the print-options table was missing `color`, `1x`, `2up`, `normal`, `full`, `single`, `1up` and `print`; the `half` row described "A5 content on A4 paper" when `half` actually sets `number-up=2` and queues files; and the session-expiry note claimed options "reset to defaults (colour, 1 copy, A4)" when they have fallen back to the chat's *saved* defaults since 1.1.2.
+
+### Changed
+- **`PrintOptions` dataclass** replaces the bare `{"color", "copies", "media", "number_up"}` dict that was passed between the wizard, the session store, the persistence layer and `print_file`. `print_file(paths, opts)` now takes one object instead of four positional parameters, and the colour/sheet-mode labels used across every reply live on the type as properties.
+- **Shared CUPS query helper** — `/status`, `/jobs` and `/cancel` were three copies of the same binary check, `-h <server>` wiring, timeout handling and stderr truncation; they now share `run_cups_query()`. Their failure messages are correspondingly more uniform.
+- **Shared print helper** — the normal and half-mode paths were two copies of the same print → notify → reply → clean-up block, so a fix to one could miss the other. Both now call `_print_and_reply()`.
+- **`set_print_options` renamed to `handle_text_message`** — it is the text handler, and it also flushes the print queue, so the old name described neither. Keyword parsing is split out into the pure `parse_option_tokens()`, which is what the new test exercises.
+- **`print_file` no longer returns its command string** — no caller used it. The string is still attached to raised errors as `.cmd` for the Telegram reply.
+
+---
+
 ## [1.1.3] – 2026-04-23
 
 ### Changed

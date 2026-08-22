@@ -6,6 +6,7 @@ import time
 import logging
 import uuid
 import io
+from dataclasses import asdict, dataclass, replace
 
 import httpx
 from PIL import Image
@@ -48,7 +49,7 @@ logger = logging.getLogger("notanext")
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "1.1.3"
+VERSION = "1.2.0"
 DATA_DIR = "data"
 PREFERENCES_FILE = os.path.join(DATA_DIR, "preferences.json")
 
@@ -69,9 +70,14 @@ PRINTABLE_EXTENSIONS = {
 # Pre-sorted display string — reused in every unsupported-type error reply
 PRINTABLE_EXTENSIONS_DISPLAY = ", ".join(sorted(PRINTABLE_EXTENSIONS))
 
-# Per-chat print options: {chat_id: {"color": bool, "copies": int, "media": str, "number_up": int, "ts": float}}
-# Entries expire after PRINT_OPTIONS_TTL seconds.
-print_options: dict[int, dict] = {}
+# Extensions merge_to_pdf() can combine into a single document. Half mode always
+# merges before printing, so anything outside this set is rejected up front
+# rather than silently falling back to a non-2-up multi-file lp job.
+MERGEABLE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".pdf"}
+MERGEABLE_EXTENSIONS_DISPLAY = ", ".join(sorted(MERGEABLE_EXTENSIONS))
+
+# Per-chat temporary print options. Entries expire after PRINT_OPTIONS_TTL seconds.
+print_options: dict[int, "PrintOptions"] = {}
 PRINT_OPTIONS_TTL = 1800  # 30 minutes
 
 # Per-chat rate limiting — minimum seconds between accepted print jobs
@@ -95,11 +101,68 @@ PREF_COLOR, PREF_MODE, PREF_PAPER = range(3)
 
 # In-memory store of per-chat persistent defaults (keyed by str(chat_id))
 # Loaded from PREFERENCES_FILE at startup and saved back on every change.
-user_preferences: dict[str, dict] = {}
+user_preferences: dict[str, "PrintOptions"] = {}
 
 # Default cap on the number of stored per-chat preference entries.
 # Overridden by MAX_PREFERENCES in the environment (must be a positive integer).
 DEFAULT_MAX_PREFERENCES = 10
+
+
+# ---------------------------------------------------------------------------
+# Print options
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PrintOptions:
+    """One chat's print settings.
+
+    The four leading fields make up the persisted profile. `ts` is the monotonic
+    timestamp of the temporary 30-minute session and is never written to disk.
+    """
+
+    color: bool = True
+    copies: int = 1
+    media: str = "A4"
+    number_up: int = 1
+    ts: float = 0.0
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "PrintOptions":
+        """Build a profile from a persisted mapping, filling in missing keys."""
+        defaults = cls()
+        return cls(
+            color=bool(data.get("color", defaults.color)),
+            copies=int(data.get("copies", defaults.copies)),
+            media=str(data.get("media", defaults.media)),
+            number_up=int(data.get("number_up", defaults.number_up)),
+        )
+
+    def to_dict(self) -> dict:
+        """Serialise the persisted profile, dropping the session timestamp."""
+        data = asdict(self)
+        data.pop("ts", None)
+        return data
+
+    @property
+    def color_label(self) -> str:
+        """Human-readable colour mode, used in every user-facing reply."""
+        return "Color" if self.color else "Gray (B&W)"
+
+    @property
+    def mode_label(self) -> str:
+        """Human-readable sheet mode, used in every user-facing reply."""
+        return "Half sheet" if self.number_up == 2 else "Normal"
+
+
+# Both wizard entry points show the same colour prompt — build it once.
+COLOR_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("🎨 Color", callback_data="pref_color_yes"),
+            InlineKeyboardButton("⬛ Gray (B&W)", callback_data="pref_color_no"),
+        ]
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
@@ -162,25 +225,52 @@ def get_preferences_limit() -> int:
     return DEFAULT_MAX_PREFERENCES
 
 
-def get_print_options(chat_id: int) -> dict:
+def parse_option_tokens(tokens: list[str], opts: PrintOptions) -> bool:
+    """Apply print-option keywords to `opts` in place.
+
+    Returns False if any token was unrecognised — the caller rejects the whole
+    message in that case, so a half-applied `opts` is never stored.
+    """
+    valid = True
+    for token in tokens:
+        if token in ("bw", "gray"):
+            opts.color = False
+        elif token == "color":
+            opts.color = True
+        elif token in COPY_OPTIONS:
+            opts.copies = COPY_OPTIONS[token]
+        elif token == "a4":
+            opts.media = "A4"
+        elif token == "a5":
+            opts.media = "A5"
+        elif token in ("half", "2up"):
+            opts.number_up = 2
+        elif token in ("normal", "full", "single", "1up"):
+            opts.number_up = 1
+        else:
+            valid = False
+    return valid
+
+
+def get_print_options(chat_id: int) -> PrintOptions:
     """Return print options for a chat, respecting the TTL and extending it on use.
 
     Falls back to the chat's saved persistent defaults (or system defaults) if no
     session options are active.
     """
     entry = print_options.get(chat_id)
-    if entry and (time.monotonic() - entry.get("ts", 0)) < PRINT_OPTIONS_TTL:
-        entry["ts"] = time.monotonic()  # Extend the session
+    if entry and (time.monotonic() - entry.ts) < PRINT_OPTIONS_TTL:
+        entry.ts = time.monotonic()  # Extend the session
         return entry
     return get_default_preferences(chat_id)
 
 
-def get_default_preferences(chat_id: int) -> dict:
+def get_default_preferences(chat_id: int) -> PrintOptions:
     """Return the saved persistent default preferences for a chat, or system defaults."""
     saved = user_preferences.get(str(chat_id))
     if saved:
-        return dict(saved)
-    return {"color": True, "copies": 1, "media": "A4", "number_up": 1}
+        return replace(saved, ts=0.0)
+    return PrintOptions()
 
 
 def load_preferences() -> None:
@@ -191,20 +281,27 @@ def load_preferences() -> None:
     """
     global user_preferences
     try:
-        if os.path.exists(PREFERENCES_FILE):
-            with open(PREFERENCES_FILE, "r") as f:
-                data = json.load(f)
-            limit = get_preferences_limit()
-            if len(data) > limit:
-                # Keep only the first `limit` entries (arbitrary but deterministic)
-                data = dict(list(data.items())[:limit])
-                logger.warning(
-                    "Preferences file exceeded limit (%d). Trimmed to %d entries.",
-                    limit,
-                    len(data),
-                )
-            user_preferences = data
-            logger.info("Loaded preferences for %d chat(s).", len(user_preferences))
+        if not os.path.exists(PREFERENCES_FILE):
+            return
+        with open(PREFERENCES_FILE, "r") as f:
+            data = json.load(f)
+        limit = get_preferences_limit()
+        if len(data) > limit:
+            # Keep only the first `limit` entries (arbitrary but deterministic)
+            data = dict(list(data.items())[:limit])
+            logger.warning(
+                "Preferences file exceeded limit (%d). Trimmed to %d entries.",
+                limit,
+                len(data),
+            )
+        loaded: dict[str, PrintOptions] = {}
+        for key, value in data.items():
+            try:
+                loaded[key] = PrintOptions.from_dict(value)
+            except (AttributeError, TypeError, ValueError) as e:
+                logger.warning("Skipping malformed preference entry %r: %s", key, e)
+        user_preferences = loaded
+        logger.info("Loaded preferences for %d chat(s).", len(user_preferences))
     except Exception as e:
         logger.warning("Could not load preferences file: %s", e)
         user_preferences = {}
@@ -216,7 +313,7 @@ def save_preferences() -> None:
         os.makedirs(DATA_DIR, exist_ok=True)
         tmp = PREFERENCES_FILE + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(user_preferences, f)
+            json.dump({k: v.to_dict() for k, v in user_preferences.items()}, f)
         os.replace(tmp, PREFERENCES_FILE)
         logger.debug("Preferences saved (%d chat(s)).", len(user_preferences))
     except Exception as e:
@@ -243,6 +340,33 @@ async def run_cups_command(cmd: list[str], timeout: int = 5) -> tuple[str, str, 
     return stdout.decode(), stderr.decode(), process.returncode
 
 
+async def run_cups_query(
+    binary: str | None, tool: str, flags: list[str], action: str
+) -> tuple[str | None, str | None]:
+    """Run a CUPS query against the configured server, returning (stdout, error).
+
+    Exactly one of the two is not None. Shared by /status, /jobs and /cancel so
+    the binary check, `-h <server>` wiring, timeout handling and stderr
+    truncation live in one place instead of once per command handler.
+    """
+    if not binary:
+        return None, f"⚠️ CUPS client tools (`{tool}`) not found on this system."
+
+    try:
+        server = get_cups_server()
+        stdout, stderr, returncode = await run_cups_command([binary, "-h", server, *flags])
+    except asyncio.TimeoutError:
+        return None, f"⚠️ {action} timed out."
+    except RuntimeError as e:
+        return None, f"⚠️ Configuration error: {e}"
+
+    if returncode != 0:
+        err = stderr.strip()[:MAX_STDERR_LENGTH] or "Unknown error"
+        return None, f"⚠️ {action} failed: `{err}`"
+
+    return stdout, None
+
+
 # ---------------------------------------------------------------------------
 # Bot text constants
 # ---------------------------------------------------------------------------
@@ -259,14 +383,14 @@ HELP_TEXT = (
     "Send a *photo* or *document* to print it.\n\n"
     "*Print options* — send before your file:\n"
     "  `bw` or `gray` — black & white\n"
-    "  `2x`, `3x`, `4x` — multiple copies\n"
-    "  `a4`, `a5` — specific paper size\n"
-    "  `half` — queue files and print 2 per sheet\n"
+    "  `color` — full colour\n"
+    "  `1x`, `2x`, `3x`, `4x` — number of copies\n"
+    "  `a4`, `a5` — paper size\n"
+    "  `half` or `2up` — queue files and print 2 per sheet\n"
+    "  `normal`, `full`, `single` or `1up` — one page per sheet\n"
     "  `print` — flush queued half-mode files now\n"
-    "  `bw half` — B&W half-sheet (common combo)\n"
     "  `bw 2x a5` — combine options\n\n"
-    "_Per-session settings persist for 30 minutes._\n"
-    "_Default settings are saved permanently per chat._"
+    "_Per-session settings persist for 30 minutes, then fall back to your saved defaults._"
 )
 
 
@@ -281,11 +405,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     welcome = "👋 Welcome to *NotaNext*!\n\nSend me a photo or document and I'll print it for you.\n\n"
     if saved:
-        color_label = "Color" if saved.get("color", True) else "Gray (B&W)"
-        mode_label = "Half sheet" if saved.get("number_up", 1) == 2 else "Normal"
-        paper_label = saved.get("media", "A4")
         welcome += (
-            f"📌 *Current defaults:* {color_label} · {mode_label} · {paper_label}\n\n"
+            f"📌 *Current defaults:* {saved.color_label} · {saved.mode_label} · {saved.media}\n\n"
             "Update your default printing preferences below, or use /help to get started.\n\n"
         )
     else:
@@ -293,32 +414,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     welcome += "*Color mode?*"
 
-    keyboard = [
-        [
-            InlineKeyboardButton("🎨 Color", callback_data="pref_color_yes"),
-            InlineKeyboardButton("⬛ Gray (B&W)", callback_data="pref_color_no"),
-        ]
-    ]
     await update.effective_message.reply_text(
         welcome,
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=COLOR_KEYBOARD,
     )
     return PREF_COLOR
 
 
 async def preferences_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the default-preference wizard directly."""
-    keyboard = [
-        [
-            InlineKeyboardButton("🎨 Color", callback_data="pref_color_yes"),
-            InlineKeyboardButton("⬛ Gray (B&W)", callback_data="pref_color_no"),
-        ]
-    ]
     await update.effective_message.reply_text(
         "⚙️ *Set Default Preferences*\n\n*Color mode?*",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=COLOR_KEYBOARD,
     )
     return PREF_COLOR
 
@@ -328,9 +437,8 @@ async def pref_color_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
 
-    color = query.data == "pref_color_yes"
-    context.user_data["pref_color"] = color
-    color_label = "Color" if color else "Gray (B&W)"
+    draft = PrintOptions(color=query.data == "pref_color_yes")
+    context.user_data["pref_draft"] = draft
 
     keyboard = [
         [
@@ -339,7 +447,7 @@ async def pref_color_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         ]
     ]
     await query.edit_message_text(
-        f"✅ Color mode: *{color_label}*\n\n*Sheet mode?*",
+        f"✅ Color mode: *{draft.color_label}*\n\n*Sheet mode?*",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -351,11 +459,9 @@ async def pref_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
 
-    half = query.data == "pref_mode_half"
-    context.user_data["pref_mode_half"] = half
-    color = context.user_data.get("pref_color", True)
-    color_label = "Color" if color else "Gray (B&W)"
-    mode_label = "Half sheet" if half else "Normal"
+    draft = context.user_data.get("pref_draft") or PrintOptions()
+    draft.number_up = 2 if query.data == "pref_mode_half" else 1
+    context.user_data["pref_draft"] = draft
 
     keyboard = [
         [
@@ -364,7 +470,7 @@ async def pref_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ]
     ]
     await query.edit_message_text(
-        f"✅ Color mode: *{color_label}*\n✅ Sheet mode: *{mode_label}*\n\n*Paper size?*",
+        f"✅ Color mode: *{draft.color_label}*\n✅ Sheet mode: *{draft.mode_label}*\n\n*Paper size?*",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -376,10 +482,9 @@ async def pref_paper_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
 
-    paper = "A5" if query.data == "pref_paper_A5" else "A4"
     chat_id = update.effective_chat.id
-    color = context.user_data.pop("pref_color", True)
-    half = context.user_data.pop("pref_mode_half", False)
+    draft = context.user_data.pop("pref_draft", None) or PrintOptions()
+    draft.media = "A5" if query.data == "pref_paper_A5" else "A4"
 
     key = str(chat_id)
     limit = get_preferences_limit()
@@ -393,27 +498,19 @@ async def pref_paper_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return ConversationHandler.END
 
-    prefs = {
-        "color": color,
-        "copies": 1,
-        "media": paper,
-        "number_up": 2 if half else 1,
-    }
-    user_preferences[key] = prefs
+    user_preferences[key] = replace(draft, ts=0.0)
     save_preferences()
 
     # Apply the new defaults immediately for this active chat session.
     # Without this, a previously cached 30-minute override can keep using old
     # settings (e.g. normal mode) even though defaults were just saved.
-    print_options[chat_id] = {**prefs, "ts": time.monotonic()}
+    print_options[chat_id] = replace(draft, ts=time.monotonic())
 
-    color_label = "Color" if color else "Gray (B&W)"
-    mode_label = "Half sheet" if half else "Normal"
     await query.edit_message_text(
         "✅ *Default preferences saved!*\n\n"
-        f"  🎨 Color mode: *{color_label}*\n"
-        f"  📄 Sheet mode: *{mode_label}*\n"
-        f"  📐 Paper size: *{paper}*\n\n"
+        f"  🎨 Color mode: *{draft.color_label}*\n"
+        f"  📄 Sheet mode: *{draft.mode_label}*\n"
+        f"  📐 Paper size: *{draft.media}*\n\n"
         "These will be used every time you print.\n"
         "Send text options like `bw` or `half` to override them temporarily.\n"
         "Use /preferences to change your defaults at any time.",
@@ -423,109 +520,64 @@ async def pref_paper_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def cancel_preferences(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel the preference-setting wizard."""
-    context.user_data.pop("pref_color", None)
-    context.user_data.pop("pref_mode_half", None)
-    await update.effective_message.reply_text("❌ Preference setup cancelled.")
+    """Cancel the preference-setting wizard.
+
+    /cancel is bound both here (as the wizard's fallback) and to cancel_command.
+    While the wizard is open this handler wins, so the reply says how to reach
+    the print-queue meaning of the command.
+    """
+    context.user_data.pop("pref_draft", None)
+    await update.effective_message.reply_text(
+        "❌ Preference setup cancelled.\n"
+        "Send /cancel again to cancel pending print jobs."
+    )
     return ConversationHandler.END
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the command and print-option reference."""
     await update.effective_message.reply_text(HELP_TEXT, parse_mode="Markdown")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Report whether the configured printer is reachable via CUPS."""
-    if not LPSTAT_BIN:
-        await update.effective_message.reply_text(
-            "⚠️ CUPS client tools (`lpstat`) not found on this system.",
-            parse_mode="Markdown",
-        )
-        return
+    stdout, error = await run_cups_query(LPSTAT_BIN, "lpstat", ["-p"], "Printer status check")
 
-    try:
-        server = get_cups_server()
-        cmd = [LPSTAT_BIN, "-h", server, "-p"]
-        stdout, stderr, returncode = await run_cups_command(cmd, timeout=5)
-
-        if returncode == 0:
-            if stdout.strip():
-                msg = f"🟢 Printer is available:\n```\n{stdout.strip()}\n```"
-            else:
-                msg = "🟡 No printers are currently registered on the server."
-        else:
-            err = stderr.strip()[:MAX_STDERR_LENGTH]
-            msg = f"🔴 Could not reach printer server:\n`{err or 'Unknown error'}`"
-
-    except asyncio.TimeoutError:
-        msg = "⚠️ Printer status check timed out."
-    except RuntimeError as e:
-        msg = f"⚠️ Configuration error: {e}"
+    if error:
+        msg = error
+    elif stdout.strip():
+        msg = f"🟢 Printer is available:\n```\n{stdout.strip()}\n```"
+    else:
+        msg = "🟡 No printers are currently registered on the server."
 
     await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
 
 async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show the current CUPS print queue."""
-    if not LPSTAT_BIN:
-        await update.effective_message.reply_text(
-            "⚠️ CUPS client tools (`lpstat`) not found on this system.",
-            parse_mode="Markdown",
-        )
-        return
+    stdout, error = await run_cups_query(LPSTAT_BIN, "lpstat", ["-o"], "Print queue check")
 
-    try:
-        server = get_cups_server()
-        cmd = [LPSTAT_BIN, "-h", server, "-o"]
-        stdout, stderr, returncode = await run_cups_command(cmd, timeout=5)
-
-        if returncode == 0:
-            msg = (
-                f"🖨️ Print queue:\n```\n{stdout.strip()}\n```"
-                if stdout.strip()
-                else "📭 No jobs in queue"
-            )
-        else:
-            err = stderr.strip()[:MAX_STDERR_LENGTH]
-            msg = f"⚠️ Could not fetch queue: {err or 'Unknown error'}"
-
-    except asyncio.TimeoutError:
-        msg = "⚠️ Print queue check timed out."
-    except RuntimeError as e:
-        msg = f"⚠️ Configuration error: {e}"
+    if error:
+        msg = error
+    elif stdout.strip():
+        msg = f"🖨️ Print queue:\n```\n{stdout.strip()}\n```"
+    else:
+        msg = "📭 No jobs in queue"
 
     await update.effective_message.reply_text(msg, parse_mode="Markdown")
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Cancel all pending print jobs."""
-    if not CANCEL_BIN:
-        await update.effective_message.reply_text(
-            "⚠️ CUPS client tools (`cancel`) not found on this system.",
-            parse_mode="Markdown",
-        )
-        return
-
-    try:
-        server = get_cups_server()
-        cmd = [CANCEL_BIN, "-h", server, "-a"]
-        _, stderr, returncode = await run_cups_command(cmd, timeout=5)
-
-        if returncode == 0:
-            msg = "🗑️ All print jobs cancelled"
-        else:
-            err = stderr.strip()[:MAX_STDERR_LENGTH]
-            msg = f"⚠️ Could not cancel jobs: {err or 'Unknown error'}"
-
-    except asyncio.TimeoutError:
-        msg = "⚠️ Cancel command timed out."
-    except RuntimeError as e:
-        msg = f"⚠️ Configuration error: {e}"
-
-    await update.effective_message.reply_text(msg)
+    _, error = await run_cups_query(CANCEL_BIN, "cancel", ["-a"], "Cancel command")
+    await update.effective_message.reply_text(
+        error or "🗑️ All print jobs cancelled",
+        parse_mode="Markdown",
+    )
 
 
 async def clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete every cached file in the data directory, including queued files."""
     # Clear all half-mode queues — their files will be removed by perform_cleanup below
     half_queue.clear()
     # Offload blocking I/O to a thread pool to avoid stalling the event loop
@@ -535,8 +587,13 @@ async def clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def set_print_options(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Parse print option keywords from a text message."""
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle a plain text message: either a print-option update or the `print` action.
+
+    `print` is an action keyword rather than a setting — it flushes whatever is
+    currently queued in half mode. Everything else is parsed as option keywords,
+    and a single unrecognised token rejects the whole message.
+    """
     chat_id = update.effective_chat.id
     text = update.effective_message.text.strip().lower()
 
@@ -549,53 +606,29 @@ async def set_print_options(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 parse_mode="Markdown",
             )
             return
-        opts = get_print_options(chat_id)
-        await _flush_half_queue(update, context, chat_id, opts)
+        await _flush_half_queue(update, context, chat_id, get_print_options(chat_id))
         return
 
-    current_opts = get_print_options(chat_id)
-    color = current_opts.get("color", True)
-    copies = current_opts.get("copies", 1)
-    media = current_opts.get("media", "A4")
-    number_up = current_opts.get("number_up", 1)
-    valid = True
+    # Start from the options currently in force, as a copy — the live session
+    # object must not be mutated until the whole message parses cleanly.
+    opts = replace(get_print_options(chat_id), ts=time.monotonic())
 
     tokens = text.split()
-    for token in tokens:
-        if token in ("bw", "gray"):
-            color = False
-        elif token == "color":
-            color = True
-        elif token in COPY_OPTIONS:
-            copies = COPY_OPTIONS[token]
-        elif token == "a4":
-            media = "A4"
-        elif token == "a5":
-            media = "A5"
-        elif token in ("half", "2up"):
-            number_up = 2
-        elif token in ("normal", "full", "single", "1up"):
-            number_up = 1
-        else:
-            valid = False
+    valid = parse_option_tokens(tokens, opts)
 
     if not valid or not tokens:
         await update.effective_message.reply_text(
-            "❓ Unknown option. Use: `bw`, `color`, `2x`, `3x`, `4x`, `a4`, `a5`, `half`, `normal`, `print`",
+            "❓ Unknown option. Use: `bw`, `color`, `1x`, `2x`, `3x`, `4x`, "
+            "`a4`, `a5`, `half`, `normal`, `print`",
             parse_mode="Markdown",
         )
         return
 
-    print_options[chat_id] = {
-        "color": color, 
-        "copies": copies, 
-        "media": media,
-        "number_up": number_up,
-        "ts": time.monotonic()
-    }
+    print_options[chat_id] = opts
 
     # If switching away from half mode, discard any pending queued files.
-    if number_up != 2:
+    notice = ""
+    if opts.number_up != 2:
         old_entry = half_queue.pop(chat_id, None)
         if old_entry and old_entry.get("files"):
             for fp in old_entry["files"]:
@@ -605,15 +638,13 @@ async def set_print_options(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 except OSError as e:
                     logger.warning("Could not remove queued file %s: %s", fp, e)
             notice = f"⚠️ {len(old_entry['files'])} queued file(s) cleared (half mode disabled).\n"
-        else:
-            notice = ""
-    else:
-        notice = ""
 
-    mode = "B&W" if not color else "Color"
-    count = f"{copies} copies" if copies > 1 else "1 copy"
-    format_str = f"{media} (Half Sheet)" if number_up == 2 else media
-    await update.effective_message.reply_text(f"{notice}⚙️ Settings updated: {mode}, {count}, {format_str}\n_(Active for 30m)_", parse_mode="Markdown")
+    count = f"{opts.copies} copies" if opts.copies > 1 else "1 copy"
+    format_str = f"{opts.media} (Half Sheet)" if opts.number_up == 2 else opts.media
+    await update.effective_message.reply_text(
+        f"{notice}⚙️ Settings updated: {opts.color_label}, {count}, {format_str}\n_(Active for 30m)_",
+        parse_mode="Markdown",
+    )
 
 
 async def _get_file_info(update: Update) -> tuple | None:
@@ -659,8 +690,53 @@ async def _get_file_info(update: Update) -> tuple | None:
     return None
 
 
+async def _print_and_reply(
+    update: Update,
+    chat_id: int,
+    file_paths: list[str],
+    opts: PrintOptions,
+    success_text: str,
+) -> None:
+    """Print files, notify Home Assistant, reply, and always clean the files up.
+
+    Shared by the normal and half-mode paths so their error handling and
+    temporary-file cleanup cannot drift apart.
+    """
+    try:
+        await print_file(file_paths, opts)
+
+        # Fire the HA webhook after a confirmed print, before the Telegram reply
+        await notify_homeassistant(
+            file_name=", ".join(os.path.basename(fp) for fp in file_paths),
+            chat_id=chat_id,
+            copies=opts.copies,
+            color=opts.color,
+        )
+        await update.effective_message.reply_text(success_text, parse_mode="Markdown")
+
+    except RuntimeError as e:
+        logger.error("Print failed: %s", e)
+        cmd_used = getattr(e, "cmd", None)
+        msg = f"❌ Print failed: {e}"
+        if cmd_used:
+            msg += f"\n\nCommand used:\n{cmd_used}"
+        await update.effective_message.reply_text(msg)
+
+    except Exception as e:
+        logger.exception("Unexpected error during print: %s", e)
+        await update.effective_message.reply_text(f"❌ Unexpected error: {e}")
+
+    finally:
+        for fp in file_paths:
+            try:
+                os.remove(fp)
+                logger.info("Cleaned up %s", fp)
+            except OSError as exc:
+                logger.warning("Could not remove %s: %s", fp, exc)
+
+
 async def _flush_half_queue(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, opts: dict
+    update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, opts: PrintOptions
 ) -> None:
     """Rate-limit, then print all files queued for this chat in half mode.
 
@@ -674,9 +750,8 @@ async def _flush_half_queue(
 
     # Files in the half queue were always queued in half mode; ensure opts reflect that
     # even if the 30-minute TTL has since expired and get_print_options returned defaults.
-    if opts.get("number_up", 1) != 2:
-        opts = dict(opts)
-        opts["number_up"] = 2
+    if opts.number_up != 2:
+        opts = replace(opts, number_up=2)
 
     # ── Rate limiting ────────────────────────────────────────────────────────
     now = time.monotonic()
@@ -698,49 +773,15 @@ async def _flush_half_queue(
     file_count = len(files)
     sheet_count = (file_count + 1) // 2
 
-    try:
-        await print_file(
-            files,
-            color=opts["color"],
-            copies=opts["copies"],
-            media=opts["media"],
-            number_up=opts["number_up"],
-        )
-        await notify_homeassistant(
-            file_name=", ".join(os.path.basename(fp) for fp in files),
-            chat_id=chat_id,
-            copies=opts["copies"],
-            color=opts["color"],
-        )
-        await update.effective_message.reply_text(
-            f"✅ Sent {file_count} file(s) to printer! "
-            f"(~{sheet_count} sheet{'s' if sheet_count != 1 else ''})"
-            + (
-                "\n_(Half mode still active — send your next file when ready.)_"
-                if opts.get("number_up", 1) == 2 else ""
-            ),
-            parse_mode="Markdown",
-        )
-
-    except RuntimeError as e:
-        logger.error("Print failed: %s", e)
-        cmd_used = getattr(e, "cmd", None)
-        msg = f"❌ Print failed: {e}"
-        if cmd_used:
-            msg += f"\n\nCommand used:\n{cmd_used}"
-        await update.effective_message.reply_text(msg)
-
-    except Exception as e:
-        logger.exception("Unexpected error during print: %s", e)
-        await update.effective_message.reply_text(f"❌ Unexpected error: {e}")
-
-    finally:
-        for fp in files:
-            try:
-                os.remove(fp)
-                logger.info("Cleaned up %s", fp)
-            except OSError as exc:
-                logger.warning("Could not remove %s: %s", fp, exc)
+    await _print_and_reply(
+        update,
+        chat_id,
+        files,
+        opts,
+        f"✅ Sent {file_count} file(s) to printer! "
+        f"(~{sheet_count} sheet{'s' if sheet_count != 1 else ''})"
+        "\n_(Half mode still active — send your next file when ready.)_",
+    )
 
 
 async def print_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -757,12 +798,24 @@ async def print_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     opts = get_print_options(chat_id)
 
     # ── Half mode: queue files and auto-print every 2 ────────────────────────
-    if opts["number_up"] == 2:
+    if opts.number_up == 2:
         file_info = await _get_file_info(update)
         if file_info is None:
             return
 
         file_obj, orig_ext = file_info
+
+        # Half mode prints through a merged PDF, so reject anything unmergeable
+        # before downloading it rather than silently printing it full-page.
+        if orig_ext not in MERGEABLE_EXTENSIONS:
+            await update.effective_message.reply_text(
+                f"❌ `{orig_ext}` cannot be combined in half mode "
+                f"(supported: {MERGEABLE_EXTENSIONS_DISPLAY}).\n"
+                "Send `normal` first to print it as a full page.",
+                parse_mode="Markdown",
+            )
+            return
+
         os.makedirs(DATA_DIR, exist_ok=True)
         file_path = os.path.join(DATA_DIR, f"{uuid.uuid4().hex}{orig_ext}")
         await file_obj.download_to_drive(file_path)
@@ -817,44 +870,7 @@ async def print_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await file_obj.download_to_drive(file_path)
     logger.info("File saved at %s", file_path)
 
-    try:
-        await print_file(
-            [file_path],
-            color=opts["color"],
-            copies=opts["copies"],
-            media=opts["media"],
-            number_up=opts["number_up"],
-        )
-
-        # Fire HA webhook in the try block (after confirmed print, before reply)
-        await notify_homeassistant(
-            file_name=os.path.basename(file_path),
-            chat_id=chat_id,
-            copies=opts["copies"],
-            color=opts["color"],
-        )
-        await update.effective_message.reply_text("✅ Sent to printer!")
-
-    except RuntimeError as e:
-        logger.error("Print failed: %s", e)
-        cmd_used = getattr(e, "cmd", None)
-        msg = f"❌ Print failed: {e}"
-        if cmd_used:
-            msg += f"\n\nCommand used:\n{cmd_used}"
-        await update.effective_message.reply_text(msg)
-
-    except Exception as e:
-        logger.exception("Unexpected error during print: %s", e)
-        await update.effective_message.reply_text(
-            f"❌ Unexpected error: {e}"
-        )
-
-    finally:
-        try:
-            os.remove(file_path)
-            logger.info("Cleaned up %s", file_path)
-        except OSError as e:
-            logger.warning("Could not remove %s: %s", file_path, e)
+    await _print_and_reply(update, chat_id, [file_path], opts, "✅ Sent to printer!")
 
 
 # ---------------------------------------------------------------------------
@@ -871,10 +887,10 @@ def merge_to_pdf(file_paths: list[str], output_path: str, pad_for_half: bool = F
     writer = PdfWriter()
     first_page_width = None
     first_page_height = None
-    
+
     for fp in file_paths:
-        ext = fp.lower().split('.')[-1]
-        if ext in ('jpg', 'jpeg', 'png', 'gif'):
+        ext = os.path.splitext(fp)[1].lower()
+        if ext in ('.jpg', '.jpeg', '.png', '.gif'):
             img = Image.open(fp)
             if img.mode != 'RGB':
                 img = img.convert('RGB')
@@ -887,7 +903,7 @@ def merge_to_pdf(file_paths: list[str], output_path: str, pad_for_half: bool = F
                     first_page_width = float(page.mediabox.width)
                     first_page_height = float(page.mediabox.height)
                 writer.add_page(page)
-        elif ext == 'pdf':
+        elif ext == '.pdf':
             reader = PdfReader(fp)
             for page in reader.pages:
                 if first_page_width is None or first_page_height is None:
@@ -895,24 +911,24 @@ def merge_to_pdf(file_paths: list[str], output_path: str, pad_for_half: bool = F
                     first_page_height = float(page.mediabox.height)
                 writer.add_page(page)
         else:
-            raise RuntimeError(f"Half mode merging is only supported for Images and PDFs. Found: .{ext}")
+            raise RuntimeError(f"Half mode merging is only supported for Images and PDFs. Found: {ext}")
 
     if pad_for_half and len(writer.pages) == 1 and first_page_width and first_page_height:
         writer.add_blank_page(width=first_page_width, height=first_page_height)
-            
+
     with open(output_path, "wb") as f:
         writer.write(f)
 
-async def print_file(file_paths: list[str], color: bool = True, copies: int = 1, media: str = "A4", number_up: int = 1) -> str:
+
+async def print_file(file_paths: list[str], opts: PrintOptions) -> None:
     """Send one or more files to the printer using lp.
 
-    Multiple files are passed as a single lp job so that, combined with
-    number-up=2 (half mode), CUPS places both files on the same physical sheet.
+    In half mode the inputs are merged into a single PDF first: passing several
+    files to one lp job makes CUPS place them on separate sheets rather than
+    applying the number-up layout.
 
     Always passes -h <CUPS_SERVER> and -d <PRINTER_NAME> explicitly.
     Both environment variables are required — raises RuntimeError if missing.
-
-    Returns the shell command string that was executed.
     """
     if not LP_BIN:
         raise RuntimeError("lp command not found — is cups-client installed?")
@@ -922,33 +938,37 @@ async def print_file(file_paths: list[str], color: bool = True, copies: int = 1,
 
     merged_path = None
     print_paths = list(file_paths)
-    if number_up > 1:
-        mergeable_exts = {".jpg", ".jpeg", ".png", ".gif", ".pdf"}
-        is_mergeable = all(
-            os.path.splitext(path)[1].lower() in mergeable_exts
+    if opts.number_up > 1:
+        unmergeable = [
+            os.path.basename(path)
             for path in file_paths
-        )
-        if is_mergeable:
-            merged_path = os.path.join(DATA_DIR, f"{uuid.uuid4().hex}_merged.pdf")
-            # For a single input in half mode, pad with a blank 2nd page so CUPS
-            # consistently applies a true 2-up layout on one physical sheet.
-            pad_for_half = len(file_paths) == 1
-            await asyncio.to_thread(merge_to_pdf, file_paths, merged_path, pad_for_half)
-            print_paths = [merged_path]
+            if os.path.splitext(path)[1].lower() not in MERGEABLE_EXTENSIONS
+        ]
+        if unmergeable:
+            raise RuntimeError(
+                f"Half mode cannot combine: {', '.join(unmergeable)}. "
+                f"Supported: {MERGEABLE_EXTENSIONS_DISPLAY}"
+            )
+        merged_path = os.path.join(DATA_DIR, f"{uuid.uuid4().hex}_merged.pdf")
+        # For a single input in half mode, pad with a blank 2nd page so CUPS
+        # consistently applies a true 2-up layout on one physical sheet.
+        pad_for_half = len(file_paths) == 1
+        await asyncio.to_thread(merge_to_pdf, file_paths, merged_path, pad_for_half)
+        print_paths = [merged_path]
 
     server = get_cups_server()
     printer = get_printer_name()
 
     # Build: lp -h <server> -d <printer> -o fit-to-page -o media=<media> [options] <file(s)>
-    cmd = [LP_BIN, "-h", server, "-d", printer, "-o", "fit-to-page", "-o", f"media={media}"]
+    cmd = [LP_BIN, "-h", server, "-d", printer, "-o", "fit-to-page", "-o", f"media={opts.media}"]
 
-    if number_up > 1:
-        cmd += ["-o", f"number-up={number_up}"]
-    if not color:
+    if opts.number_up > 1:
+        cmd += ["-o", f"number-up={opts.number_up}"]
+    if not opts.color:
         # ColorModel=Gray is standard CUPS; CNColorMode=mono is Canon UFRII specific
         cmd += ["-o", "ColorModel=Gray", "-o", "CNColorMode=mono"]
-    if copies > 1:
-        cmd += ["-n", str(copies)]
+    if opts.copies > 1:
+        cmd += ["-n", str(opts.copies)]
     cmd.extend(print_paths)
 
     cmd_str = " ".join(cmd)
@@ -969,7 +989,7 @@ async def print_file(file_paths: list[str], color: bool = True, copies: int = 1,
             ex = RuntimeError("lp command timed out after 30 seconds")
             ex.cmd = cmd_str  # type: ignore[attr-defined]
             raise ex
-    
+
         if process.returncode != 0:
             err_str = stderr.decode().strip()[:MAX_STDERR_LENGTH]
             logger.error(
@@ -980,9 +1000,8 @@ async def print_file(file_paths: list[str], color: bool = True, copies: int = 1,
             ex = RuntimeError(err_str or "Print command failed")
             ex.cmd = cmd_str  # type: ignore[attr-defined]
             raise ex
-    
+
         logger.info("lp stdout: %s", stdout.decode().strip())
-        return cmd_str
     finally:
         if merged_path:
             try:
@@ -990,7 +1009,6 @@ async def print_file(file_paths: list[str], color: bool = True, copies: int = 1,
                 logger.info("Cleaned up merged file %s", merged_path)
             except OSError as e:
                 logger.warning("Could not remove merged file %s: %s", merged_path, e)
-
 
 
 # ---------------------------------------------------------------------------
@@ -1067,7 +1085,7 @@ async def cleanup_task() -> None:
         now = time.monotonic()
         expired_chats = [
             cid for cid, entry in print_options.items()
-            if (now - entry.get("ts", 0)) >= PRINT_OPTIONS_TTL
+            if (now - entry.ts) >= PRINT_OPTIONS_TTL
         ]
         for cid in expired_chats:
             print_options.pop(cid, None)
@@ -1109,7 +1127,7 @@ async def cleanup_task() -> None:
                 for entry in half_queue.values()
                 for fp in entry.get("files", [])
             )
-            removed = await perform_cleanup_async(frozenset(active_files))
+            removed = await perform_cleanup_async(active_files)
             logger.info("Periodic cleanup removed %d file(s).", removed)
         except Exception as e:
             logger.error("Periodic cleanup failed: %s", e)
@@ -1191,11 +1209,22 @@ def main() -> None:
         .build()
     )
 
-    # Preference-setting wizard — handles /start and /preferences
+    if allowed_chat_ids:
+        chat_id_filter = filters.Chat(chat_id=allowed_chat_ids)
+    else:
+        logger.warning(
+            "ALLOWED_CHAT_IDS is not set — all Telegram users can print. "
+            "Set this variable to restrict access."
+        )
+        chat_id_filter = filters.ALL
+
+    # Preference-setting wizard — handles /start and /preferences.
+    # Both entry points are chat-filtered: saved profiles are a capped resource
+    # (MAX_PREFERENCES), so unrestricted access would let strangers exhaust it.
     pref_conv = ConversationHandler(
         entry_points=[
-            CommandHandler("start", start),
-            CommandHandler("preferences", preferences_command),
+            CommandHandler("start", start, filters=chat_id_filter),
+            CommandHandler("preferences", preferences_command, filters=chat_id_filter),
         ],
         states={
             PREF_COLOR: [CallbackQueryHandler(pref_color_callback, pattern="^pref_color_")],
@@ -1210,15 +1239,6 @@ def main() -> None:
     application.add_handler(CommandHandler("status", status))
 
     # Restricted commands and message handlers
-    if allowed_chat_ids:
-        chat_id_filter = filters.Chat(chat_id=allowed_chat_ids)
-    else:
-        logger.warning(
-            "ALLOWED_CHAT_IDS is not set — all Telegram users can print. "
-            "Set this variable to restrict access."
-        )
-        chat_id_filter = filters.ALL
-
     application.add_handler(CommandHandler("jobs", jobs_command, filters=chat_id_filter))
     application.add_handler(CommandHandler("cancel", cancel_command, filters=chat_id_filter))
     application.add_handler(CommandHandler("clean", clean, filters=chat_id_filter))
@@ -1237,7 +1257,7 @@ def main() -> None:
             chat_id_filter
             & filters.TEXT
             & (~filters.COMMAND),
-            set_print_options,
+            handle_text_message,
         )
     )
 
