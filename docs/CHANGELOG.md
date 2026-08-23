@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 - **`1x` copy option** — explicitly resets the copy count to one. Previously only `2x`–`4x` existed, so there was no way to undo a multi-copy setting without waiting out the 30-minute session.
 - **Blank-page padding in half mode** — a single file printed with `half` now gets a blank second page appended to the merged PDF, so CUPS applies a true 2-up layout on one physical sheet instead of letting the driver scale the content to a full page.
+- **`docs/USER-SPEC.md`** — a single user-facing specification: every command, every print option, the half-sheet workflow, session and preference lifetimes, and the hard limits. Previously these were spread across `HELP_TEXT`, the README and this changelog.
 - **`test_bot.py`** — a dependency-free self-check (`python3 test_bot.py`) covering option parsing, the preference persistence round-trip, the half-mode extension gate, and version consistency between `bot.py`, `docker-compose.yml`, `README.md` and this changelog. It also covers the shared cooldown helper and asserts the preference cap is a constant rather than an environment variable.
 
 ### Fixed — Security
@@ -31,11 +32,11 @@ All notable changes to this project will be documented in this file.
 - **`perform_cleanup()` uses `os.scandir()`** instead of `os.listdir()` plus a per-entry `os.path.isfile()` stat.
 - **`merge_to_pdf()` no longer leaks a file handle per PDF input.** `PdfReader(path)` kept the handle open for the process's lifetime; the reader now runs inside a `with open(...)` block, which is safe because `PdfWriter.add_page()` clones eagerly. The image branch also stopped rebinding the name bound by `with Image.open(...)`, which read as if the converted copy were the one being closed.
 - **The shared Home Assistant client is closed on shutdown** via a `post_shutdown` hook, instead of leaving its connection pool to process exit.
+- **Every fix recorded in this changelog was re-validated against the tree** (62 checks over 1.0.0–1.2.0: subprocess reaping, the pre-download size and extension gates, the rate-limit slot claim, the Canon dual grayscale flags, the half-mode merge, the systemd and entrypoint hardening). One regression surfaced and was reverted: an attempt to shorten the `LOG_LEVEL` block had dropped the invalid-value warning that 1.0.6 added specifically to kill a silent fallback. `merge_to_pdf()` was additionally exercised against real `pypdf` and `Pillow` — 10 checks covering RGBA/grayscale conversion, mixed image+PDF input, blank-page padding geometry, unmergeable rejection, and file-descriptor growth over 30 merges.
 
 ### Removed
 - **`MAX_PREFERENCES` and `DOCKER_IMAGE` environment variables.** The preference cap is a safety bound, not a tuning knob — it is now the module constant `MAX_PREFERENCES = 10`, and the `get_preferences_limit()` parser, its validation warning and the "raise the limit" hint in the full-store reply are gone. `DOCKER_IMAGE` only wrapped `docker-compose.yml`'s `image:` in a `${VAR:-default}`; the tag is now written directly, and `docker compose up -d --build` still builds it locally.
 - **`PRINT_OPTIONS_TTL` and `HALF_QUEUE_TTL`** — both had become bare aliases of `SESSION_TTL` with no remaining references.
-- **The `LOG_LEVEL` validation block** collapses to one `getattr` with a fallback. An unrecognised value still defaults to `INFO`, but no longer prints a warning to stderr before logging is configured.
 
 ---
 

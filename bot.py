@@ -27,11 +27,18 @@ from telegram.ext import (
 # Logging setup
 # ---------------------------------------------------------------------------
 
-# LOG_LEVEL falls back to INFO when unset or unrecognised.
-_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+# LOG_LEVEL falls back to INFO when unset or unrecognised. The warning goes to
+# stdout because logging is not configured yet — a silent fallback was the 1.0.6
+# bug, so do not trade it away for a shorter block.
+_raw_level = os.getenv("LOG_LEVEL", "INFO").upper()
+_level = getattr(logging, _raw_level, None)
+if not isinstance(_level, int):
+    print(f"WARNING: Invalid LOG_LEVEL={_raw_level!r} — defaulting to INFO.")
+    _level = logging.INFO
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=_level if isinstance(_level, int) else logging.INFO,
+    level=_level,
 )
 
 # Suppress noisy library loggers — only show WARNING and above from these

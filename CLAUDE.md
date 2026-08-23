@@ -98,7 +98,9 @@ Temporary files are cleaned in two places: the merged PDF in `print_file`'s `fin
 
 ## Release
 
-`VERSION` is duplicated in four places and a bump must touch all of them: `bot.py` (`VERSION` constant), `docker-compose.yml` (both the `image:` tag and the `VERSION` build arg), the pinned-pull example in `README.md`, and a new entry in `docs/CHANGELOG.md`. `test_bot.py::test_version_matches_changelog` checks all four. Pushing a `v*.*.*` tag is what publishes the image.
+`VERSION` is duplicated in five places and a bump must touch all of them: `bot.py` (`VERSION` constant), `docker-compose.yml` (both the `image:` tag and the `VERSION` build arg), the pinned-pull example in `README.md`, the header of `docs/USER-SPEC.md`, and a new entry in `docs/CHANGELOG.md`. `test_bot.py::test_version_matches_changelog` checks all five. Pushing a `v*.*.*` tag is what publishes the image.
+
+`docs/USER-SPEC.md` is the user-facing contract — commands, option keywords, the half-sheet workflow, session and preference lifetimes, and the hard limits. Any change to those behaviours has to land there as well as in `HELP_TEXT` and the README.
 
 The changelog is the project's design record — half-mode merging, the Canon color flags, the subprocess-leak fixes, and the rate-limit rationale are all documented there. Read it before changing print behaviour.
 
@@ -107,6 +109,8 @@ The changelog is the project's design record — half-mode merging, the Canon co
 `docker-entrypoint.sh` writes `/etc/cups/client.conf` from `CUPS_SERVER`, then TCP-probes port 631 up to ten times (raw `/dev/tcp`, not HTTP — the CUPS web UI is often disabled on headless servers) before calling `lpoptions -d`. The compose file mounts `./data:/app/data`, which is what makes `preferences.json` survive container recreation.
 
 Configuration is deliberately small: `TOKEN`, `CUPS_SERVER`, `PRINTER_NAME`, `ALLOWED_CHAT_IDS`, `LOG_LEVEL`, `TZ`, and the `HA_URL`/`HA_TOKEN` pair. That is the whole surface. The preference cap (`MAX_PREFERENCES`) and the image tag are constants in `bot.py` and `docker-compose.yml`, not environment variables, because they are bounds rather than deployment settings — don't reintroduce a variable for a value that has one correct answer.
+
+The invalid-`LOG_LEVEL` warning at the top of `bot.py` prints to stdout because logging is not configured yet. It looks like noise worth deleting; 1.0.6 added it precisely because the fallback was silent. Leave it.
 
 `docker-compose.yml` deliberately has **no `environment:` block** — it once hardcoded `CUPS_SERVER`, `PRINTER_NAME` and `TZ`, which silently overrode `env_file:` and made editing `.env` a no-op. All configuration comes from `.env`.
 

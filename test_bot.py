@@ -135,9 +135,12 @@ def test_version_matches_changelog():
         compose = f.read()
     with open("README.md") as f:
         readme = f.read()
+    with open("docs/USER-SPEC.md") as f:
+        spec = f.read()
     assert f"## [{bot.VERSION}]" in changelog, "no CHANGELOG entry for VERSION"
     assert bot.VERSION in compose, "docker-compose.yml is pinned to another version"
     assert f":{bot.VERSION}" in readme, "README.md does not reference current VERSION"
+    assert f"Version {bot.VERSION}" in spec, "docs/USER-SPEC.md documents another VERSION"
 
 
 if __name__ == "__main__":

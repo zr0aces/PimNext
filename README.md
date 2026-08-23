@@ -197,7 +197,7 @@ docker pull ghcr.io/zr0aces/notanext:latest
 docker pull ghcr.io/zr0aces/notanext:1.2.0
 ```
 
-See [docs/CHANGELOG.md](docs/CHANGELOG.md) for release notes.
+See [docs/USER-SPEC.md](docs/USER-SPEC.md) for the full user-facing specification — every command, option, limit and lifetime in one place — and [docs/CHANGELOG.md](docs/CHANGELOG.md) for release notes.
 
 ---
 
