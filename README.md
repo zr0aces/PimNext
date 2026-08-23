@@ -70,8 +70,6 @@ chmod 600 .env   # restrict read access — .env contains your Telegram token
 | `HA_URL` | ❌ No | Home Assistant base URL (e.g. `http://homeassistant:8123`). Required together with `HA_TOKEN`. |
 | `HA_TOKEN` | ❌ No | Home Assistant long-lived access token. Required together with `HA_URL`. |
 | `TZ` | ❌ No | Timezone for container logs (e.g. `Asia/Bangkok`). Default: UTC. |
-| `MAX_PREFERENCES` | ❌ No | Maximum number of chats whose saved defaults are stored on disk. Must be a positive integer. Default: `10`. |
-| `DOCKER_IMAGE` | ❌ No | Image used by `docker-compose.yml`. Set it to use a local tag or a different registry. Default: `ghcr.io/zr0aces/notanext:1.2.0`. |
 
 ---
 

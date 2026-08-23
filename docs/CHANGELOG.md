@@ -7,8 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 - **`1x` copy option** — explicitly resets the copy count to one. Previously only `2x`–`4x` existed, so there was no way to undo a multi-copy setting without waiting out the 30-minute session.
 - **Blank-page padding in half mode** — a single file printed with `half` now gets a blank second page appended to the merged PDF, so CUPS applies a true 2-up layout on one physical sheet instead of letting the driver scale the content to a full page.
-- **`test_bot.py`** — a dependency-free self-check (`python3 test_bot.py`) covering option parsing, the preference persistence round-trip, the half-mode extension gate, and version consistency between `bot.py`, `docker-compose.yml`, and this changelog.
-- **`MAX_PREFERENCES` documented in the README** environment table, along with `DOCKER_IMAGE`. Both were already implemented but only mentioned in `.env.example`.
+- **`test_bot.py`** — a dependency-free self-check (`python3 test_bot.py`) covering option parsing, the preference persistence round-trip, the half-mode extension gate, and version consistency between `bot.py`, `docker-compose.yml`, `README.md` and this changelog. It also covers the shared cooldown helper and asserts the preference cap is a constant rather than an environment variable.
 
 ### Fixed — Security
 - **`/start` and `/preferences` were unrestricted.** The preference wizard's entry points carried no chat filter, so any Telegram user could reach it and consume one of the `MAX_PREFERENCES` slots (default 10) — locking legitimate users out with "the preference store is full". Both entry points now use the same `ALLOWED_CHAT_IDS` filter as `/jobs`, `/cancel`, `/clean`, and the file handlers.
@@ -21,11 +20,22 @@ All notable changes to this project will be documented in this file.
 - **README corrections** — the print-options table was missing `color`, `1x`, `2up`, `normal`, `full`, `single`, `1up` and `print`; the `half` row described "A5 content on A4 paper" when `half` actually sets `number-up=2` and queues files; and the session-expiry note claimed options "reset to defaults (colour, 1 copy, A4)" when they have fallen back to the chat's *saved* defaults since 1.1.2.
 
 ### Changed
-- **`PrintOptions` dataclass** replaces the bare `{"color", "copies", "media", "number_up"}` dict that was passed between the wizard, the session store, the persistence layer and `print_file`. `print_file(paths, opts)` now takes one object instead of four positional parameters, and the colour/sheet-mode labels used across every reply live on the type as properties.
+- **`PrintOptions` and `HalfQueueEntry` dataclasses** replace the bare dicts that were passed between the wizard, the session store, the persistence layer, the half-mode queue and `print_file`. `print_file(paths, opts)` takes one object instead of four positional parameters, and the colour/sheet-mode labels used across every reply live on the type as properties.
 - **Shared CUPS query helper** — `/status`, `/jobs` and `/cancel` were three copies of the same binary check, `-h <server>` wiring, timeout handling and stderr truncation; they now share `run_cups_query()`. Their failure messages are correspondingly more uniform.
 - **Shared print helper** — the normal and half-mode paths were two copies of the same print → notify → reply → clean-up block, so a fix to one could miss the other. Both now call `_print_and_reply()`.
+- **Reusable HTTP client & pre-built keyboards** — Home Assistant notification reuses a persistent `httpx.AsyncClient` connection pool, and inline keyboards are instantiated once at module load to reduce allocations and resource consumption.
 - **`set_print_options` renamed to `handle_text_message`** — it is the text handler, and it also flushes the print queue, so the old name described neither. Keyword parsing is split out into the pure `parse_option_tokens()`, which is what the new test exercises.
 - **`print_file` no longer returns its command string** — no caller used it. The string is still attached to raised errors as `.cmd` for the Telegram reply.
+- **Reusable HTTP client and pre-built keyboards** — Home Assistant notifications now share one persistent `httpx.AsyncClient` (and its connection pool) instead of building and tearing one down per print, and the three wizard keyboards are constructed once at import instead of on every callback.
+- **Shared cooldown helper** — the normal and half-mode paths each carried their own copy of the elapsed/remaining rate-limit arithmetic; both now call `cooldown_remaining()`.
+- **`perform_cleanup()` uses `os.scandir()`** instead of `os.listdir()` plus a per-entry `os.path.isfile()` stat.
+- **`merge_to_pdf()` no longer leaks a file handle per PDF input.** `PdfReader(path)` kept the handle open for the process's lifetime; the reader now runs inside a `with open(...)` block, which is safe because `PdfWriter.add_page()` clones eagerly. The image branch also stopped rebinding the name bound by `with Image.open(...)`, which read as if the converted copy were the one being closed.
+- **The shared Home Assistant client is closed on shutdown** via a `post_shutdown` hook, instead of leaving its connection pool to process exit.
+
+### Removed
+- **`MAX_PREFERENCES` and `DOCKER_IMAGE` environment variables.** The preference cap is a safety bound, not a tuning knob — it is now the module constant `MAX_PREFERENCES = 10`, and the `get_preferences_limit()` parser, its validation warning and the "raise the limit" hint in the full-store reply are gone. `DOCKER_IMAGE` only wrapped `docker-compose.yml`'s `image:` in a `${VAR:-default}`; the tag is now written directly, and `docker compose up -d --build` still builds it locally.
+- **`PRINT_OPTIONS_TTL` and `HALF_QUEUE_TTL`** — both had become bare aliases of `SESSION_TTL` with no remaining references.
+- **The `LOG_LEVEL` validation block** collapses to one `getattr` with a fallback. An unrecognised value still defaults to `INFO`, but no longer prints a warning to stderr before logging is configured.
 
 ---
 

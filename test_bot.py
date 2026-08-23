@@ -17,7 +17,7 @@ for _name in ("httpx", "PIL", "PIL.Image", "pypdf", "telegram", "telegram.ext"):
     sys.modules.setdefault(_name, mock.MagicMock())
 
 import bot  # noqa: E402
-from bot import PrintOptions, parse_option_tokens  # noqa: E402
+from bot import HalfQueueEntry, PrintOptions, parse_option_tokens  # noqa: E402
 
 
 def test_defaults():
@@ -26,6 +26,14 @@ def test_defaults():
     assert opts.copies == 1
     assert opts.media == "A4"
     assert opts.number_up == 1
+
+
+def test_half_queue_entry_defaults():
+    entry = HalfQueueEntry()
+    assert entry.files == []
+    assert entry.ts == 0.0
+    entry.files.append("test.pdf")
+    assert entry.files == ["test.pdf"]
 
 
 def test_parses_every_documented_keyword():
@@ -92,14 +100,44 @@ def test_half_mode_gate_is_narrower_than_printable():
         assert ext not in bot.MERGEABLE_EXTENSIONS
 
 
+def test_cooldown_remaining():
+    """The shared rate-limit helper must block the whole cooldown window."""
+    import time
+
+    chat = -999
+    bot.last_print_time.pop(chat, None)
+    assert bot.cooldown_remaining(chat) == 0, "an unseen chat is never rate-limited"
+
+    bot.last_print_time[chat] = time.monotonic()
+    remaining = bot.cooldown_remaining(chat)
+    assert remaining == bot.PRINT_COOLDOWN, f"a fresh print should block for the full window, got {remaining}"
+
+    # A fraction of a second left must still block, and must never report "0s".
+    bot.last_print_time[chat] = time.monotonic() - (bot.PRINT_COOLDOWN - 0.4)
+    assert bot.cooldown_remaining(chat) == 1
+
+    bot.last_print_time[chat] = time.monotonic() - bot.PRINT_COOLDOWN
+    assert bot.cooldown_remaining(chat) == 0
+    bot.last_print_time.pop(chat, None)
+
+
+def test_preferences_cap_is_a_constant():
+    """The cap is a safety bound, not a tunable — it must not read the environment."""
+    assert isinstance(bot.MAX_PREFERENCES, int) and bot.MAX_PREFERENCES >= 1
+    assert not hasattr(bot, "get_preferences_limit"), "the env-var parser should be gone"
+
+
 def test_version_matches_changelog():
     """The four places VERSION lives must not drift apart."""
     with open("docs/CHANGELOG.md") as f:
         changelog = f.read()
     with open("docker-compose.yml") as f:
         compose = f.read()
+    with open("README.md") as f:
+        readme = f.read()
     assert f"## [{bot.VERSION}]" in changelog, "no CHANGELOG entry for VERSION"
     assert bot.VERSION in compose, "docker-compose.yml is pinned to another version"
+    assert f":{bot.VERSION}" in readme, "README.md does not reference current VERSION"
 
 
 if __name__ == "__main__":

@@ -1,23 +1,23 @@
 import asyncio
+import io
 import json
+import logging
 import os
 import shutil
 import time
-import logging
 import uuid
-import io
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 
 import httpx
 from PIL import Image
-from pypdf import PdfWriter, PdfReader
+from pypdf import PdfReader, PdfWriter
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
-    ConversationHandler,
     ContextTypes,
+    ConversationHandler,
     MessageHandler,
     filters,
 )
@@ -27,16 +27,11 @@ from telegram.ext import (
 # Logging setup
 # ---------------------------------------------------------------------------
 
-# Validate and apply LOG_LEVEL — warn loudly if the value is unrecognised
-log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-numeric_level = getattr(logging, log_level, None)
-if not isinstance(numeric_level, int):
-    print(f"WARNING: Invalid LOG_LEVEL={log_level!r} — defaulting to INFO.")
-    numeric_level = logging.INFO
-
+# LOG_LEVEL falls back to INFO when unset or unrecognised.
+_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=numeric_level,
+    level=_level if isinstance(_level, int) else logging.INFO,
 )
 
 # Suppress noisy library loggers — only show WARNING and above from these
@@ -76,18 +71,9 @@ PRINTABLE_EXTENSIONS_DISPLAY = ", ".join(sorted(PRINTABLE_EXTENSIONS))
 MERGEABLE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".pdf"}
 MERGEABLE_EXTENSIONS_DISPLAY = ", ".join(sorted(MERGEABLE_EXTENSIONS))
 
-# Per-chat temporary print options. Entries expire after PRINT_OPTIONS_TTL seconds.
-print_options: dict[int, "PrintOptions"] = {}
-PRINT_OPTIONS_TTL = 1800  # 30 minutes
-
-# Per-chat rate limiting — minimum seconds between accepted print jobs
-PRINT_COOLDOWN = 10  # seconds
-last_print_time: dict[int, float] = {}
-
-# Per-chat half-mode queue: {chat_id: {"files": [path, ...], "ts": float}}
-# Holds downloaded file paths waiting to be paired before printing.
-half_queue: dict[int, dict] = {}
-HALF_QUEUE_TTL = 1800  # 30 minutes — matches PRINT_OPTIONS_TTL
+# Session and rate-limit timeouts
+PRINT_COOLDOWN = 10  # minimum seconds between accepted print jobs
+SESSION_TTL = 1800  # 30 minutes for temporary overrides & half-queue
 
 # CUPS binary paths — resolved once at startup to avoid repeated filesystem scans
 LP_BIN: str | None = shutil.which("lp")
@@ -99,17 +85,13 @@ COPY_OPTIONS: dict[str, int] = {"1x": 1, "2x": 2, "3x": 3, "4x": 4}
 # Conversation states for the preference-setting wizard
 PREF_COLOR, PREF_MODE, PREF_PAPER = range(3)
 
-# In-memory store of per-chat persistent defaults (keyed by str(chat_id))
-# Loaded from PREFERENCES_FILE at startup and saved back on every change.
-user_preferences: dict[str, "PrintOptions"] = {}
-
-# Default cap on the number of stored per-chat preference entries.
-# Overridden by MAX_PREFERENCES in the environment (must be a positive integer).
-DEFAULT_MAX_PREFERENCES = 10
+# Cap on the number of stored per-chat preference entries. Keeps preferences.json
+# bounded and stops an open wizard from being used to exhaust the store.
+MAX_PREFERENCES = 10
 
 
 # ---------------------------------------------------------------------------
-# Print options
+# Dataclasses & State
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -154,7 +136,15 @@ class PrintOptions:
         return "Half sheet" if self.number_up == 2 else "Normal"
 
 
-# Both wizard entry points show the same colour prompt — build it once.
+@dataclass
+class HalfQueueEntry:
+    """Queued files and timestamp for a half-mode print session."""
+
+    files: list[str] = field(default_factory=list)
+    ts: float = 0.0
+
+
+# Keyboards pre-built once at startup to avoid runtime allocations
 COLOR_KEYBOARD = InlineKeyboardMarkup(
     [
         [
@@ -163,6 +153,30 @@ COLOR_KEYBOARD = InlineKeyboardMarkup(
         ]
     ]
 )
+
+MODE_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("📄 Normal (full page)", callback_data="pref_mode_normal"),
+            InlineKeyboardButton("📑 Half sheet (2 per page)", callback_data="pref_mode_half"),
+        ]
+    ]
+)
+
+PAPER_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("A4", callback_data="pref_paper_A4"),
+            InlineKeyboardButton("A5", callback_data="pref_paper_A5"),
+        ]
+    ]
+)
+
+# Chat state (in-memory)
+print_options: dict[int, PrintOptions] = {}
+last_print_time: dict[int, float] = {}
+half_queue: dict[int, HalfQueueEntry] = {}
+user_preferences: dict[str, PrintOptions] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -203,35 +217,12 @@ def get_allowed_chat_ids() -> list[int]:
     return ids
 
 
-def get_preferences_limit() -> int:
-    """Return the maximum number of per-chat preference entries to store.
-
-    Reads MAX_PREFERENCES from the environment (default: DEFAULT_MAX_PREFERENCES).
-    Logs a warning and falls back to the default when the value is invalid.
-    """
-    raw = os.getenv("MAX_PREFERENCES", "")
-    if raw.strip():
-        try:
-            val = int(raw.strip())
-            if val < 1:
-                raise ValueError("must be >= 1")
-            return val
-        except ValueError:
-            logger.warning(
-                "Invalid MAX_PREFERENCES=%r — must be a positive integer. Using default (%d).",
-                raw,
-                DEFAULT_MAX_PREFERENCES,
-            )
-    return DEFAULT_MAX_PREFERENCES
-
-
 def parse_option_tokens(tokens: list[str], opts: PrintOptions) -> bool:
     """Apply print-option keywords to `opts` in place.
 
     Returns False if any token was unrecognised — the caller rejects the whole
     message in that case, so a half-applied `opts` is never stored.
     """
-    valid = True
     for token in tokens:
         if token in ("bw", "gray"):
             opts.color = False
@@ -248,8 +239,15 @@ def parse_option_tokens(tokens: list[str], opts: PrintOptions) -> bool:
         elif token in ("normal", "full", "single", "1up"):
             opts.number_up = 1
         else:
-            valid = False
-    return valid
+            return False
+    return True
+
+
+def cooldown_remaining(chat_id: int) -> int:
+    """Seconds left on this chat's print cooldown, or 0 if it may print now."""
+    elapsed = time.monotonic() - last_print_time.get(chat_id, 0)
+    # Round up so the last fractional second still blocks (and never reports "0s").
+    return int(PRINT_COOLDOWN - elapsed) + 1 if elapsed < PRINT_COOLDOWN else 0
 
 
 def get_print_options(chat_id: int) -> PrintOptions:
@@ -259,7 +257,7 @@ def get_print_options(chat_id: int) -> PrintOptions:
     session options are active.
     """
     entry = print_options.get(chat_id)
-    if entry and (time.monotonic() - entry.ts) < PRINT_OPTIONS_TTL:
+    if entry and (time.monotonic() - entry.ts) < SESSION_TTL:
         entry.ts = time.monotonic()  # Extend the session
         return entry
     return get_default_preferences(chat_id)
@@ -276,8 +274,8 @@ def get_default_preferences(chat_id: int) -> PrintOptions:
 def load_preferences() -> None:
     """Load per-chat persistent preferences from disk into memory.
 
-    Trims the loaded data to the configured limit (MAX_PREFERENCES) so that a
-    previously oversized file doesn't exceed the current limit at runtime.
+    Trims the loaded data to MAX_PREFERENCES so an oversized file from an older
+    build doesn't exceed the cap at runtime.
     """
     global user_preferences
     try:
@@ -285,15 +283,10 @@ def load_preferences() -> None:
             return
         with open(PREFERENCES_FILE, "r") as f:
             data = json.load(f)
-        limit = get_preferences_limit()
-        if len(data) > limit:
-            # Keep only the first `limit` entries (arbitrary but deterministic)
-            data = dict(list(data.items())[:limit])
-            logger.warning(
-                "Preferences file exceeded limit (%d). Trimmed to %d entries.",
-                limit,
-                len(data),
-            )
+        if len(data) > MAX_PREFERENCES:
+            # Keep only the first MAX_PREFERENCES entries (arbitrary but deterministic)
+            data = dict(list(data.items())[:MAX_PREFERENCES])
+            logger.warning("Preferences file exceeded cap. Trimmed to %d entries.", len(data))
         loaded: dict[str, PrintOptions] = {}
         for key, value in data.items():
             try:
@@ -440,16 +433,10 @@ async def pref_color_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     draft = PrintOptions(color=query.data == "pref_color_yes")
     context.user_data["pref_draft"] = draft
 
-    keyboard = [
-        [
-            InlineKeyboardButton("📄 Normal (full page)", callback_data="pref_mode_normal"),
-            InlineKeyboardButton("📑 Half sheet (2 per page)", callback_data="pref_mode_half"),
-        ]
-    ]
     await query.edit_message_text(
         f"✅ Color mode: *{draft.color_label}*\n\n*Sheet mode?*",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=MODE_KEYBOARD,
     )
     return PREF_MODE
 
@@ -463,16 +450,10 @@ async def pref_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     draft.number_up = 2 if query.data == "pref_mode_half" else 1
     context.user_data["pref_draft"] = draft
 
-    keyboard = [
-        [
-            InlineKeyboardButton("A4", callback_data="pref_paper_A4"),
-            InlineKeyboardButton("A5", callback_data="pref_paper_A5"),
-        ]
-    ]
     await query.edit_message_text(
         f"✅ Color mode: *{draft.color_label}*\n✅ Sheet mode: *{draft.mode_label}*\n\n*Paper size?*",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=PAPER_KEYBOARD,
     )
     return PREF_PAPER
 
@@ -487,14 +468,11 @@ async def pref_paper_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     draft.media = "A5" if query.data == "pref_paper_A5" else "A4"
 
     key = str(chat_id)
-    limit = get_preferences_limit()
 
-    # Enforce the cap: reject new entries beyond the limit (updates to existing entries are always allowed)
-    if key not in user_preferences and len(user_preferences) >= limit:
+    # Enforce the cap: reject new entries (updates to existing entries always pass)
+    if key not in user_preferences and len(user_preferences) >= MAX_PREFERENCES:
         await query.edit_message_text(
-            f"⚠️ The preference store is full ({limit} chat(s) already saved).\n"
-            "A bot administrator can raise the limit via the MAX\\_PREFERENCES environment variable.",
-            parse_mode="Markdown",
+            f"⚠️ The preference store is full ({MAX_PREFERENCES} chat(s) already saved).",
         )
         return ConversationHandler.END
 
@@ -600,7 +578,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # "print" is an action keyword — flush the half-mode queue immediately.
     if text == "print":
         entry = half_queue.get(chat_id)
-        if not entry or not entry.get("files"):
+        if not entry or not entry.files:
             await update.effective_message.reply_text(
                 "❓ No files queued. Send a file with `half` mode active to queue it.",
                 parse_mode="Markdown",
@@ -614,9 +592,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     opts = replace(get_print_options(chat_id), ts=time.monotonic())
 
     tokens = text.split()
-    valid = parse_option_tokens(tokens, opts)
-
-    if not valid or not tokens:
+    if not tokens or not parse_option_tokens(tokens, opts):
         await update.effective_message.reply_text(
             "❓ Unknown option. Use: `bw`, `color`, `1x`, `2x`, `3x`, `4x`, "
             "`a4`, `a5`, `half`, `normal`, `print`",
@@ -630,14 +606,14 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     notice = ""
     if opts.number_up != 2:
         old_entry = half_queue.pop(chat_id, None)
-        if old_entry and old_entry.get("files"):
-            for fp in old_entry["files"]:
+        if old_entry and old_entry.files:
+            for fp in old_entry.files:
                 try:
                     os.remove(fp)
                     logger.info("Cleared stale half-queue file on option change: %s", fp)
                 except OSError as e:
                     logger.warning("Could not remove queued file %s: %s", fp, e)
-            notice = f"⚠️ {len(old_entry['files'])} queued file(s) cleared (half mode disabled).\n"
+            notice = f"⚠️ {len(old_entry.files)} queued file(s) cleared (half mode disabled).\n"
 
     count = f"{opts.copies} copies" if opts.copies > 1 else "1 copy"
     format_str = f"{opts.media} (Half Sheet)" if opts.number_up == 2 else opts.media
@@ -744,7 +720,7 @@ async def _flush_half_queue(
     the user can retry by sending `print` after the cooldown expires.
     """
     entry = half_queue.get(chat_id)
-    if not entry or not entry.get("files"):
+    if not entry or not entry.files:
         await update.effective_message.reply_text("❓ No files are queued for printing.")
         return
 
@@ -754,19 +730,16 @@ async def _flush_half_queue(
         opts = replace(opts, number_up=2)
 
     # ── Rate limiting ────────────────────────────────────────────────────────
-    now = time.monotonic()
-    elapsed = now - last_print_time.get(chat_id, 0)
-    if elapsed < PRINT_COOLDOWN:
-        remaining = int(PRINT_COOLDOWN - elapsed)
-        file_count = len(entry["files"])
+    remaining = cooldown_remaining(chat_id)
+    if remaining:
         await update.effective_message.reply_text(
             f"⏳ Please wait {remaining}s before printing. "
-            f"Your {file_count} queued file(s) are ready — send `print` when the cooldown ends.",
+            f"Your {len(entry.files)} queued file(s) are ready — send `print` when the cooldown ends.",
             parse_mode="Markdown",
         )
         return
 
-    files = list(entry["files"])
+    files = list(entry.files)
     half_queue.pop(chat_id, None)
     last_print_time[chat_id] = time.monotonic()
 
@@ -821,11 +794,11 @@ async def print_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await file_obj.download_to_drive(file_path)
         logger.info("Half-mode: queued file at %s", file_path)
 
-        entry = half_queue.setdefault(chat_id, {"files": [], "ts": 0})
-        entry["files"].append(file_path)
-        entry["ts"] = time.monotonic()
+        entry = half_queue.setdefault(chat_id, HalfQueueEntry())
+        entry.files.append(file_path)
+        entry.ts = time.monotonic()
 
-        file_count = len(entry["files"])
+        file_count = len(entry.files)
         sheet_count = (file_count + 1) // 2
 
         if file_count % 2 == 1:
@@ -842,11 +815,8 @@ async def print_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # ── Normal mode ──────────────────────────────────────────────────────────
-    # Rate limiting
-    now = time.monotonic()
-    elapsed = now - last_print_time.get(chat_id, 0)
-    if elapsed < PRINT_COOLDOWN:
-        remaining = int(PRINT_COOLDOWN - elapsed)
+    remaining = cooldown_remaining(chat_id)
+    if remaining:
         await update.effective_message.reply_text(
             f"⏳ Please wait {remaining}s before sending another print job."
         )
@@ -885,31 +855,29 @@ def merge_to_pdf(file_paths: list[str], output_path: str, pad_for_half: bool = F
     on half of a physical sheet (instead of some drivers scaling full-page).
     """
     writer = PdfWriter()
-    first_page_width = None
-    first_page_height = None
+    first_page_width: float | None = None
+    first_page_height: float | None = None
+
+    def _add_pages_from_reader(reader: PdfReader) -> None:
+        nonlocal first_page_width, first_page_height
+        for page in reader.pages:
+            if first_page_width is None or first_page_height is None:
+                first_page_width = float(page.mediabox.width)
+                first_page_height = float(page.mediabox.height)
+            writer.add_page(page)
 
     for fp in file_paths:
         ext = os.path.splitext(fp)[1].lower()
         if ext in ('.jpg', '.jpeg', '.png', '.gif'):
-            img = Image.open(fp)
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            img_pdf = io.BytesIO()
-            img.save(img_pdf, format='PDF')
+            with Image.open(fp) as img:
+                img_pdf = io.BytesIO()
+                (img if img.mode == 'RGB' else img.convert('RGB')).save(img_pdf, format='PDF')
             img_pdf.seek(0)
-            reader = PdfReader(img_pdf)
-            for page in reader.pages:
-                if first_page_width is None or first_page_height is None:
-                    first_page_width = float(page.mediabox.width)
-                    first_page_height = float(page.mediabox.height)
-                writer.add_page(page)
+            _add_pages_from_reader(PdfReader(img_pdf))
         elif ext == '.pdf':
-            reader = PdfReader(fp)
-            for page in reader.pages:
-                if first_page_width is None or first_page_height is None:
-                    first_page_width = float(page.mediabox.width)
-                    first_page_height = float(page.mediabox.height)
-                writer.add_page(page)
+            # add_page() clones eagerly, so the handle can close once the loop ends.
+            with open(fp, 'rb') as pdf_f:
+                _add_pages_from_reader(PdfReader(pdf_f))
         else:
             raise RuntimeError(f"Half mode merging is only supported for Images and PDFs. Found: {ext}")
 
@@ -1015,6 +983,17 @@ async def print_file(file_paths: list[str], opts: PrintOptions) -> None:
 # Home Assistant integration
 # ---------------------------------------------------------------------------
 
+_ha_client: httpx.AsyncClient | None = None
+
+
+def get_ha_client() -> httpx.AsyncClient:
+    """Return a shared persistent AsyncClient for Home Assistant notifications."""
+    global _ha_client
+    if _ha_client is None or _ha_client.is_closed:
+        _ha_client = httpx.AsyncClient(timeout=3)
+    return _ha_client
+
+
 async def notify_homeassistant(
     file_name: str, chat_id: int, copies: int, color: bool
 ) -> None:
@@ -1035,14 +1014,13 @@ async def notify_homeassistant(
         "color": color,
     }
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                url,
-                json=payload,
-                headers={"Authorization": f"Bearer {ha_token}"},
-                timeout=3,
-            )
-            response.raise_for_status()
+        client = get_ha_client()
+        response = await client.post(
+            url,
+            json=payload,
+            headers={"Authorization": f"Bearer {ha_token}"},
+        )
+        response.raise_for_status()
         logger.info("Home Assistant notified: %s", url)
     except Exception as e:
         logger.warning("Home Assistant notification failed: %s", e)
@@ -1070,6 +1048,14 @@ async def post_init(application) -> None:
     logger.info("Periodic cleanup task started (6h interval)")
 
 
+async def post_shutdown(application) -> None:
+    """Close the shared Home Assistant HTTP client on a clean shutdown."""
+    global _ha_client
+    if _ha_client is not None and not _ha_client.is_closed:
+        await _ha_client.aclose()
+    _ha_client = None
+
+
 def _on_cleanup_task_done(task: asyncio.Task) -> None:
     """Log if the background cleanup task crashes unexpectedly."""
     if not task.cancelled() and task.exception():
@@ -1080,12 +1066,12 @@ async def cleanup_task() -> None:
     """Background task: evict stale print options and remove leftover data files."""
     while True:
         await asyncio.sleep(6 * 3600)  # every 6 hours
+        now = time.monotonic()
 
         # Evict expired print_options entries that were never consumed (leak prevention)
-        now = time.monotonic()
         expired_chats = [
             cid for cid, entry in print_options.items()
-            if (now - entry.ts) >= PRINT_OPTIONS_TTL
+            if (now - entry.ts) >= SESSION_TTL
         ]
         for cid in expired_chats:
             print_options.pop(cid, None)
@@ -1095,7 +1081,7 @@ async def cleanup_task() -> None:
         # Evict stale last_print_time entries (prevents unbounded growth)
         stale_rate = [
             cid for cid, ts in last_print_time.items()
-            if (now - ts) >= PRINT_OPTIONS_TTL
+            if (now - ts) >= SESSION_TTL
         ]
         for cid in stale_rate:
             last_print_time.pop(cid, None)
@@ -1105,12 +1091,12 @@ async def cleanup_task() -> None:
         # Evict expired half-queue entries and delete their files
         expired_half = [
             cid for cid, entry in half_queue.items()
-            if (now - entry.get("ts", 0)) >= HALF_QUEUE_TTL
+            if (now - entry.ts) >= SESSION_TTL
         ]
         for cid in expired_half:
             entry = half_queue.pop(cid, None)
             if entry:
-                for fp in entry.get("files", []):
+                for fp in entry.files:
                     try:
                         os.remove(fp)
                         logger.info("Evicted stale half-queue file: %s", fp)
@@ -1125,7 +1111,7 @@ async def cleanup_task() -> None:
             active_files: frozenset[str] = frozenset(
                 fp
                 for entry in half_queue.values()
-                for fp in entry.get("files", [])
+                for fp in entry.files
             )
             removed = await perform_cleanup_async(active_files)
             logger.info("Periodic cleanup removed %d file(s).", removed)
@@ -1146,17 +1132,19 @@ def perform_cleanup(skip_paths: frozenset[str] | None = None) -> int:
     """
     skip_paths = (skip_paths or frozenset()) | {PREFERENCES_FILE}
     removed = 0
-    if os.path.exists(DATA_DIR):
-        for filename in os.listdir(DATA_DIR):
-            filepath = os.path.join(DATA_DIR, filename)
-            if filepath in skip_paths:
-                continue
-            try:
-                if os.path.isfile(filepath):
-                    os.remove(filepath)
-                    removed += 1
-            except OSError as e:
-                logger.error("Error removing %s: %s", filepath, e)
+    try:
+        with os.scandir(DATA_DIR) as entries:
+            for entry in entries:
+                if entry.path in skip_paths:
+                    continue
+                try:
+                    if entry.is_file():
+                        os.remove(entry.path)
+                        removed += 1
+                except OSError as e:
+                    logger.error("Error removing %s: %s", entry.path, e)
+    except FileNotFoundError:
+        pass
     return removed
 
 
@@ -1206,6 +1194,7 @@ def main() -> None:
         ApplicationBuilder()
         .token(token)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
