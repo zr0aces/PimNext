@@ -194,7 +194,7 @@ Docker images are published automatically to [GitHub Container Registry](https:/
 docker pull ghcr.io/zr0aces/notanext:latest
 
 # Pin to a specific version
-docker pull ghcr.io/zr0aces/notanext:1.2.0
+docker pull ghcr.io/zr0aces/notanext:1.2.1
 ```
 
 Version bumps across all project files are automated from the single source of truth (`VERSION`):
