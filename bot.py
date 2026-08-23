@@ -54,9 +54,9 @@ logger = logging.getLogger("notanext")
 
 # Fallback used only if the VERSION file is missing or unreadable. Named (not
 # inlined) so scripts/bump_version.py has a stable assignment to rewrite on
-# every bump — do not phrase this comment as `DEFAULT_VERSION = "1.2.1"` or the
+# every bump — do not phrase this comment as `DEFAULT_VERSION = "1.2.2"` or the
 # bump script's regex will rewrite the comment too.
-DEFAULT_VERSION = "1.2.1"
+DEFAULT_VERSION = "1.2.2"
 
 
 def _load_version() -> str:
