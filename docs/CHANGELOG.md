@@ -7,6 +7,12 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Version bump to `1.2.1`.
 
+### Fixed
+- **CUPS output could silently break `/status`, `/jobs` and `/cancel`.** `run_cups_query()` wrapped its error string in backticks and `status`/`jobs_command` fenced raw `lpstat` output in triple backticks, all sent with `parse_mode="Markdown"`. `/jobs` lists every job on the printer, not just this bot's — a backtick, or an unmatched `_`/`*`, in another client's job title or in CUPS stderr fails Telegram's Markdown entity parser, and the whole reply is rejected by the API rather than degrading gracefully. All three handlers now send plain text; `run_cups_query()`'s docstring records why formatting must not come back without escaping.
+- **No global error handler.** Any unhandled exception in any handler — including the one above — was only logged; the user got total silence with no indication their message did anything. `error_handler()` is now registered via `application.add_error_handler()`: it logs the exception and best-effort replies with a generic apology.
+- **Unsupported message types were dropped with no feedback.** A voice note, sticker, video, GIF, or contact card matched neither of the two `MessageHandler`s (photo/document, text) and vanished silently. A third, catch-all `MessageHandler` (`unsupported_message`) now replies pointing at `/help`; it's registered last so it only catches what the other two don't.
+- **`PTBUserWarning` on every startup** — the preferences `ConversationHandler` enters via `/start`/`/preferences` (`CommandHandler`) but walks a single message through its three states via `CallbackQueryHandler` + `edit_message_text`, so PTB warned that `per_message=False` (the correct setting for this — the standard command-entry, callback-state wizard — pattern) won't track callbacks per message. `per_message=True` is not applicable here: it requires entry points and fallbacks to also be `CallbackQueryHandler`, and `/start`, `/preferences`, `/cancel` are commands. The warning is expected noise for this pattern and is now suppressed with a scoped `warnings.catch_warnings()` around just that construction, rather than printed on every process start.
+
 ---
 ## [1.2.0] – 2026-08-22
 

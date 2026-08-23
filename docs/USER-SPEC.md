@@ -59,8 +59,10 @@ step.
 
 **Accepted document types**: `.pdf`, `.ps`, `.jpg`, `.jpeg`, `.png`, `.gif`,
 `.txt`, `.doc`, `.docx`, `.odt`. Photos sent as Telegram photos are always
-accepted and are treated as `.jpg`. Anything else is refused with the supported
-list.
+accepted and are treated as `.jpg`. A document outside that list is refused
+with the supported list; anything that's neither a photo nor a document — a
+voice note, video, sticker, GIF, contact card — gets a reply pointing at
+`/help` instead of being silently ignored.
 
 **Size limit**: 20 MB [`MAX_FILE_BYTES`] — Telegram's own bot limit. Checked
 against the message metadata *before* the file is downloaded, so an oversized

@@ -6,6 +6,7 @@ import os
 import shutil
 import time
 import uuid
+import warnings
 from dataclasses import asdict, dataclass, field, replace
 
 import httpx
@@ -367,9 +368,15 @@ async def run_cups_query(
     Exactly one of the two is not None. Shared by /status, /jobs and /cancel so
     the binary check, `-h <server>` wiring, timeout handling and stderr
     truncation live in one place instead of once per command handler.
+
+    Neither return value carries Markdown formatting — CUPS stderr and stdout
+    (job titles, printer descriptions) are outside our control and a stray
+    backtick/underscore/asterisk in either breaks Telegram's Markdown parser,
+    which fails the whole reply instead of degrading gracefully. Callers must
+    not send these with parse_mode="Markdown".
     """
     if not binary:
-        return None, f"⚠️ CUPS client tools (`{tool}`) not found on this system."
+        return None, f"⚠️ CUPS client tools ({tool}) not found on this system."
 
     try:
         server = get_cups_server()
@@ -381,7 +388,7 @@ async def run_cups_query(
 
     if returncode != 0:
         err = stderr.strip()[:MAX_STDERR_LENGTH] or "Unknown error"
-        return None, f"⚠️ {action} failed: `{err}`"
+        return None, f"⚠️ {action} failed: {err}"
 
     return stdout, None
 
@@ -550,11 +557,13 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if error:
         msg = error
     elif stdout.strip():
-        msg = f"🟢 Printer is available:\n```\n{stdout.strip()}\n```"
+        msg = f"🟢 Printer is available:\n{stdout.strip()}"
     else:
         msg = "🟡 No printers are currently registered on the server."
 
-    await update.effective_message.reply_text(msg, parse_mode="Markdown")
+    # No parse_mode: lpstat output is outside our control and a stray Markdown
+    # character in it would fail the whole reply — see run_cups_query().
+    await update.effective_message.reply_text(msg)
 
 
 async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -564,20 +573,19 @@ async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if error:
         msg = error
     elif stdout.strip():
-        msg = f"🖨️ Print queue:\n```\n{stdout.strip()}\n```"
+        msg = f"🖨️ Print queue:\n{stdout.strip()}"
     else:
         msg = "📭 No jobs in queue"
 
-    await update.effective_message.reply_text(msg, parse_mode="Markdown")
+    # No parse_mode: job titles can come from other clients — see run_cups_query().
+    await update.effective_message.reply_text(msg)
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Cancel all pending print jobs."""
     _, error = await run_cups_query(CANCEL_BIN, "cancel", ["-a"], "Cancel command")
-    await update.effective_message.reply_text(
-        error or "🗑️ All print jobs cancelled",
-        parse_mode="Markdown",
-    )
+    # No parse_mode: `error` may carry raw CUPS stderr — see run_cups_query().
+    await update.effective_message.reply_text(error or "🗑️ All print jobs cancelled")
 
 
 async def clean(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1082,6 +1090,33 @@ async def post_shutdown(application) -> None:
     _ha_client = None
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log any exception a handler didn't catch, and tell the user something broke.
+
+    Without this, PTB only logs unhandled exceptions — the user gets silence
+    with no indication their message did anything at all. Best-effort: the
+    reply itself is wrapped, since the exception may be a Telegram API error
+    that would also break a plain reply (e.g. the chat was deleted).
+    """
+    logger.error("Unhandled exception while processing an update: %s", context.error, exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text("❌ Something went wrong. Please try again.")
+        except Exception:
+            logger.warning("Could not notify the user about the error above.")
+
+
+async def unsupported_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply to message types neither handler recognises (voice, video, stickers, ...).
+
+    Without this, such messages match nothing and are silently dropped — the
+    user has no way to tell whether the bot is even running.
+    """
+    await update.effective_message.reply_text(
+        "❓ I can only print photos and documents. Use /help to see what's supported."
+    )
+
+
 def _on_cleanup_task_done(task: asyncio.Task) -> None:
     """Log if the background cleanup task crashes unexpectedly."""
     if not task.cancelled() and task.exception():
@@ -1223,6 +1258,7 @@ def main() -> None:
         .post_shutdown(post_shutdown)
         .build()
     )
+    application.add_error_handler(error_handler)
 
     if allowed_chat_ids:
         chat_id_filter = filters.Chat(chat_id=allowed_chat_ids)
@@ -1236,18 +1272,34 @@ def main() -> None:
     # Preference-setting wizard — handles /start and /preferences.
     # Both entry points are chat-filtered: saved profiles are a capped resource
     # (MAX_PREFERENCES), so unrestricted access would let strangers exhaust it.
-    pref_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start, filters=chat_id_filter),
-            CommandHandler("preferences", preferences_command, filters=chat_id_filter),
-        ],
-        states={
-            PREF_COLOR: [CallbackQueryHandler(pref_color_callback, pattern="^pref_color_")],
-            PREF_MODE: [CallbackQueryHandler(pref_mode_callback, pattern="^pref_mode_")],
-            PREF_PAPER: [CallbackQueryHandler(pref_paper_callback, pattern="^pref_paper_")],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_preferences)],
-    )
+    #
+    # The wizard walks one message through all three states via edit_message_text,
+    # so per_chat + per_user (the default) is the correct key — PTB's per_message=True
+    # is not an option here since it requires entry_points and fallbacks to also be
+    # CallbackQueryHandler, and ours (/start, /preferences, /cancel) are commands.
+    # That leaves PTB's "per_message=False" advisory with no applicable fix; it is
+    # expected for this — the standard command-entry, callback-state wizard — pattern
+    # and is suppressed rather than left to print on every startup.
+    with warnings.catch_warnings():
+        from telegram.warnings import PTBUserWarning
+
+        warnings.filterwarnings(
+            "ignore",
+            message=r"If 'per_message=False', 'CallbackQueryHandler' will not be tracked.*",
+            category=PTBUserWarning,
+        )
+        pref_conv = ConversationHandler(
+            entry_points=[
+                CommandHandler("start", start, filters=chat_id_filter),
+                CommandHandler("preferences", preferences_command, filters=chat_id_filter),
+            ],
+            states={
+                PREF_COLOR: [CallbackQueryHandler(pref_color_callback, pattern="^pref_color_")],
+                PREF_MODE: [CallbackQueryHandler(pref_mode_callback, pattern="^pref_mode_")],
+                PREF_PAPER: [CallbackQueryHandler(pref_paper_callback, pattern="^pref_paper_")],
+            },
+            fallbacks=[CommandHandler("cancel", cancel_preferences)],
+        )
     application.add_handler(pref_conv)
 
     application.add_handler(CommandHandler("help", help_command))
@@ -1273,6 +1325,20 @@ def main() -> None:
             & filters.TEXT
             & (~filters.COMMAND),
             handle_text_message,
+        )
+    )
+
+    # Catch-all for message types none of the above match (voice, video,
+    # stickers, animations, contacts, ...) — otherwise these are dropped
+    # silently and the user has no idea the bot even saw them.
+    application.add_handler(
+        MessageHandler(
+            chat_id_filter
+            & (~filters.COMMAND)
+            & (~filters.PHOTO)
+            & (~filters.Document.ALL)
+            & (~filters.TEXT),
+            unsupported_message,
         )
     )
 
