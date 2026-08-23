@@ -128,7 +128,9 @@ def test_preferences_cap_is_a_constant():
 
 
 def test_version_matches_changelog():
-    """The four places VERSION lives must not drift apart."""
+    """The single source of truth VERSION and all repository files must not drift apart."""
+    with open("VERSION") as f:
+        single_source_version = f.read().strip()
     with open("docs/CHANGELOG.md") as f:
         changelog = f.read()
     with open("docker-compose.yml") as f:
@@ -137,10 +139,26 @@ def test_version_matches_changelog():
         readme = f.read()
     with open("docs/USER-SPEC.md") as f:
         spec = f.read()
+
+    assert bot.VERSION == single_source_version, "bot.VERSION does not match VERSION file"
     assert f"## [{bot.VERSION}]" in changelog, "no CHANGELOG entry for VERSION"
     assert bot.VERSION in compose, "docker-compose.yml is pinned to another version"
     assert f":{bot.VERSION}" in readme, "README.md does not reference current VERSION"
     assert f"Version {bot.VERSION}" in spec, "docs/USER-SPEC.md documents another VERSION"
+
+
+def test_bump_version_helpers():
+    """Verify semver calculations and check consistency helper."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("bump_version", "scripts/bump_version.py")
+    bump_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bump_module)
+
+    assert bump_module.calculate_next_version("1.2.0", "patch") == "1.2.1"
+    assert bump_module.calculate_next_version("1.2.0", "minor") == "1.3.0"
+    assert bump_module.calculate_next_version("1.2.0", "major") == "2.0.0"
+    assert bump_module.read_version() == bot.VERSION
+    assert bump_module.check_consistency() is True
 
 
 if __name__ == "__main__":

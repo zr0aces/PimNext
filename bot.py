@@ -51,7 +51,26 @@ logger = logging.getLogger("notanext")
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "1.2.0"
+# Fallback used only if the VERSION file is missing or unreadable. Named (not
+# inlined) so scripts/bump_version.py has a stable assignment to rewrite on
+# every bump — do not phrase this comment as `DEFAULT_VERSION = "x"` or the
+# bump script's regex will rewrite the comment too.
+DEFAULT_VERSION = "1.2.0"
+
+
+def _load_version() -> str:
+    version_file = os.path.join(os.path.dirname(__file__), "VERSION")
+    try:
+        with open(version_file, "r", encoding="utf-8") as f:
+            ver = f.read().strip()
+            if ver:
+                return ver
+    except OSError:
+        pass
+    return DEFAULT_VERSION
+
+
+VERSION = _load_version()
 DATA_DIR = "data"
 PREFERENCES_FILE = os.path.join(DATA_DIR, "preferences.json")
 

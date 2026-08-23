@@ -98,7 +98,20 @@ Temporary files are cleaned in two places: the merged PDF in `print_file`'s `fin
 
 ## Release
 
-`VERSION` is duplicated in five places and a bump must touch all of them: `bot.py` (`VERSION` constant), `docker-compose.yml` (both the `image:` tag and the `VERSION` build arg), the pinned-pull example in `README.md`, the header of `docs/USER-SPEC.md`, and a new entry in `docs/CHANGELOG.md`. `test_bot.py::test_version_matches_changelog` checks all five. Pushing a `v*.*.*` tag is what publishes the image.
+The single source of truth for versioning is the root `VERSION` file. All repository files are synchronized automatically using `scripts/bump_version.py`:
+
+```bash
+python3 scripts/bump_version.py current     # Print current version
+python3 scripts/bump_version.py check       # Verify all files match VERSION
+python3 scripts/bump_version.py patch       # Bump patch (1.2.0 -> 1.2.1)
+python3 scripts/bump_version.py minor       # Bump minor (1.2.0 -> 1.3.0)
+python3 scripts/bump_version.py major       # Bump major (1.2.0 -> 2.0.0)
+python3 scripts/bump_version.py set 1.3.0   # Set specific version
+```
+
+Flags like `--dry-run`, `--git-commit`, and `--git-tag` can be added to preview or automate git operations.
+
+The script updates `VERSION`, `bot.py`, `docker-compose.yml` (both `image:` and `VERSION` arg), `README.md`, `docs/USER-SPEC.md`, and `docs/CHANGELOG.md`. `test_bot.py::test_version_matches_changelog` and `scripts/bump_version.py check` verify all of them stay in sync. Pushing a `v*.*.*` tag is what publishes the image.
 
 `docs/USER-SPEC.md` is the user-facing contract — commands, option keywords, the half-sheet workflow, session and preference lifetimes, and the hard limits. Any change to those behaviours has to land there as well as in `HELP_TEXT` and the README.
 

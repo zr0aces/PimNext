@@ -197,6 +197,13 @@ docker pull ghcr.io/zr0aces/notanext:latest
 docker pull ghcr.io/zr0aces/notanext:1.2.0
 ```
 
+Version bumps across all project files are automated from the single source of truth (`VERSION`):
+
+```bash
+python3 scripts/bump_version.py check       # Verify version consistency
+python3 scripts/bump_version.py patch       # Bump patch version
+```
+
 See [docs/USER-SPEC.md](docs/USER-SPEC.md) for the full user-facing specification — every command, option, limit and lifetime in one place — and [docs/CHANGELOG.md](docs/CHANGELOG.md) for release notes.
 
 ---
